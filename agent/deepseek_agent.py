@@ -101,13 +101,13 @@ class DeepSeekAgent:
         market_context: Dict,
         tool_executor: Optional[Any] = None,
     ) -> Dict:
-	    prelim_score = market_context.get("preliminary_score", 0)
-	    if prelim_score >= 55:
-	        model = self.cfg.model_high_confidence      # "deepseek-v4-pro"
-	        reasoning_effort = "high"
-	    else:
-	        model = self.cfg.model                       # "deepseek-flash"
-	        reasoning_effort = "low"
+        prelim_score = market_context.get("preliminary_score", 0)
+        if prelim_score >= 55:
+            model = self.cfg.model_high_confidence      # "deepseek-v4-pro"
+            reasoning_effort = "high"
+        else:
+            model = self.cfg.model                       # "deepseek-flash"
+            reasoning_effort = "low"
 
         messages = [
             {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
