@@ -33,6 +33,33 @@ import websockets
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------- #
+#  Module-level helpers
+# --------------------------------------------------------------------- #
+def _ws_is_open(ws) -> bool:
+    """
+    Return True if a websockets connection is open.
+
+    Handles both API versions:
+      - websockets < 12  : legacy WebSocketClientProtocol → .closed
+      - websockets >= 12 : new ClientConnection          → .state
+    """
+    if ws is None:
+        return False
+    # Legacy API
+    if hasattr(ws, "closed"):
+        try:
+            return not ws.closed
+        except Exception:
+            return False
+    # New API (websockets 12+)
+    state = getattr(ws, "state", None)
+    if state is not None:
+        name = getattr(state, "name", str(state))
+        return name == "OPEN"
+    return False
+
+
 @dataclass
 class BybitConfig:
     api_key: str = ""
@@ -99,27 +126,41 @@ class BybitV5Client:
         params: Optional[Dict] = None,
         signed: bool = False,
     ) -> Dict[str, Any]:
-        """Execute REST request with retry, rate-limit back-off, and semaphore."""
+        """
+        Execute REST request with retry, rate-limit back-off, and semaphore.
+
+        Bug fix (v9.1.1): unsigned GET requests previously dropped `params`
+        because they were only appended to the URL inside the signed branch.
+        Now handled uniformly for both signed and unsigned requests.
+        """
         async with self._rate_limiter:
+            params = params or {}
             url = f"{self.base_url}{endpoint}"
             headers = {"Content-Type": "application/json"}
+            use_params: Optional[Dict] = None
+            use_json: Optional[Dict] = None
 
             if signed:
                 ts = int(time.time() * 1000)
                 if method.upper() == "GET":
+                    # Build canonical query string from params
                     query = "&".join(
-                        f"{k}={v}" for k, v in sorted((params or {}).items())
+                        f"{k}={v}" for k, v in sorted(params.items())
                     )
                     sig = self._sign(query, ts)
-                    url += f"?{query}" if query else ""
+                    if query:
+                        url += f"?{query}"
                     headers.update({
                         "X-BAPI-API-KEY": self.cfg.api_key,
                         "X-BAPI-TIMESTAMP": str(ts),
                         "X-BAPI-SIGN": sig,
                         "X-BAPI-RECV-WINDOW": str(self.cfg.recv_window),
                     })
+                    # Query already in URL — don't let aiohttp add it again
+                    use_params = None
+                    use_json = None
                 else:
-                    body = json.dumps(params or {})
+                    body = json.dumps(params)
                     sig = self._sign(body, ts)
                     headers.update({
                         "X-BAPI-API-KEY": self.cfg.api_key,
@@ -127,6 +168,16 @@ class BybitV5Client:
                         "X-BAPI-SIGN": sig,
                         "X-BAPI-RECV-WINDOW": str(self.cfg.recv_window),
                     })
+                    use_params = None
+                    use_json = params
+            else:
+                # Unsigned: pass params via aiohttp's proper channels
+                if method.upper() == "GET":
+                    use_params = params
+                    use_json = None
+                else:
+                    use_params = None
+                    use_json = params
 
             session = await self._get_session()
             last_error: Optional[Exception] = None
@@ -137,7 +188,8 @@ class BybitV5Client:
                         method,
                         url,
                         headers=headers,
-                        json=params if method.upper() != "GET" else None,
+                        params=use_params,
+                        json=use_json,
                     ) as resp:
                         data = await resp.json()
 
@@ -272,11 +324,7 @@ class BybitV5Client:
         limit: int = 200,
         category: Optional[str] = None,
     ) -> List[List]:
-        """
-        GET /v5/market/kline
-        interval: 1,3,5,15,30,60,120,240,360,720,D,M,W
-        Returns [[startTime, open, high, low, close, volume, turnover], ...]
-        """
+        """GET /v5/market/kline — returns [[ts, o, h, l, c, v, turnover], ...]"""
         data = await self._rest_request(
             "GET", "/v5/market/kline",
             params={
@@ -294,7 +342,7 @@ class BybitV5Client:
         interval_time: str = "1h",
         limit: int = 50,
     ) -> List[Dict]:
-        """GET /v5/market/open-interest — intervalTime: 5min,15min,30min,1h,4h,1d"""
+        """GET /v5/market/open-interest"""
         data = await self._rest_request(
             "GET", "/v5/market/open-interest",
             params={
@@ -397,12 +445,8 @@ class BybitV5Client:
         tpsl_mode: str = "Full",
         reduce_only: bool = False,
     ) -> Dict:
-        """
-        Place order via V5 WebSocket Trade API.
-        Native TP/SL is attached so the exchange protects the position
-        even if the bot disconnects.
-        """
-        if self._ws_trade is None or self._ws_trade.closed:
+        """Place order via V5 WebSocket Trade API with native TP/SL."""
+        if not _ws_is_open(self._ws_trade):
             await self._connect_ws_trade()
 
         req_id = f"order_{int(time.time() * 1000)}"
@@ -494,10 +538,6 @@ class BybitV5Client:
         """
         Read WebSocket messages until we see the response with the
         expected `op`. Skips pongs and unrelated messages.
-
-        Bybit V5 endpoints use different auth response schemas:
-          - /v5/trade   → {"retCode": 0, "retMsg": "OK", "op": "auth", ...}
-          - /v5/private → {"success": true, "ret_msg": "", "op": "auth", ...}
         """
         timeout = float(timeout)
         deadline = time.time() + timeout
@@ -575,7 +615,7 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        # Private WS returns `success` / `ret_msg`, NOT `retCode` / `retMsg`.
+        # Private WS uses `success` / `ret_msg`, NOT `retCode` / `retMsg`.
         auth_resp = await self._await_op_response(
             self._ws_private, "auth",
         )
@@ -590,7 +630,7 @@ class BybitV5Client:
         self, topics: List[str], callback: Callable,
     ):
         """Subscribe to private topics: position, order, execution, wallet."""
-        if self._ws_private is None or self._ws_private.closed:
+        if not _ws_is_open(self._ws_private):
             await self._connect_ws_private()
 
         await self._ws_private.send(
@@ -603,8 +643,7 @@ class BybitV5Client:
     async def _private_listener(self):
         while (
             self._running
-            and self._ws_private is not None
-            and not self._ws_private.closed
+            and _ws_is_open(self._ws_private)
         ):
             try:
                 msg = json.loads(await self._ws_private.recv())
@@ -619,6 +658,8 @@ class BybitV5Client:
                 except Exception as e:
                     logger.error(f"Private WS reconnect failed: {e}")
                     await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Private WS listener error: {e}")
                 await asyncio.sleep(1)
@@ -633,7 +674,7 @@ class BybitV5Client:
     async def stop(self):
         self._running = False
         for ws in (self._ws_public, self._ws_private, self._ws_trade):
-            if ws is not None and not ws.closed:
+            if _ws_is_open(ws):
                 try:
                     await ws.close()
                 except Exception:
