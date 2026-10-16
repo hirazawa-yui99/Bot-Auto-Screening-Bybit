@@ -41,7 +41,8 @@ Return ONLY a JSON object:
 class DeepSeekConfig:
     api_key: str
     base_url: str = "https://api.deepseek.com/v1"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-flash"
+    model_high_confidence: str = "deepseek-v4-pro"  # for raw >= 55
     temperature: float = 0.3
     max_tokens: int = 1500
     timeout: int = 30
@@ -100,6 +101,14 @@ class DeepSeekAgent:
         market_context: Dict,
         tool_executor: Optional[Any] = None,
     ) -> Dict:
+	    prelim_score = market_context.get("preliminary_score", 0)
+	    if prelim_score >= 55:
+	        model = self.cfg.model_high_confidence      # "deepseek-v4-pro"
+	        reasoning_effort = "high"
+	    else:
+	        model = self.cfg.model                       # "deepseek-flash"
+	        reasoning_effort = "low"
+
         messages = [
             {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
             {
