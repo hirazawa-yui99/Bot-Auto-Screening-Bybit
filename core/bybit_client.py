@@ -2,19 +2,30 @@
 core/bybit_client.py
 Bybit V5 Unified Trading API client.
 
-Handles REST (market data, account, instrument info) and
-WebSocket (order execution, private streams).
+Handles REST (market data, account, instruments) and WebSocket
+(order execution via Trade WS, private streams via Private WS).
 
 Reference: https://bybit-exchange.github.io/docs/v5/intro
+
+Endpoints used:
+  REST base     : https://api.bybit.com        (testnet: https://api-testnet.bybit.com)
+  WS public     : wss://stream.bybit.com/v5/public/{category}
+  WS private    : wss://stream.bybit.com/v5/private
+  WS trade      : wss://stream.bybit.com/v5/trade
+
+Auth response schemas (IMPORTANT — they differ):
+  Trade WS   : {"retCode": 0, "retMsg": "OK",  "op": "auth", ...}
+  Private WS : {"success": true, "ret_msg": "", "op": "auth", ...}
 """
+
 import asyncio
-import hmac
 import hashlib
+import hmac
 import json
-import time
 import logging
-from typing import Optional, Dict, List, Any, Callable
+import time
 from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 import websockets
@@ -37,15 +48,10 @@ class BybitV5Client:
     """
     Unified Bybit V5 client with full-symbol scanning support.
 
-    REST base: https://api.bybit.com  (testnet: https://api-testnet.bybit.com)
-    WS public:  wss://stream.bybit.com/v5/public/{category}
-    WS private: wss://stream.bybit.com/v5/private
-    WS trade:   wss://stream.bybit.com/v5/trade
-
-    Rate limits (per official docs):
+    REST limits (per Bybit docs):
       - HTTP IP limit: 600 req / 5s window across all api.bybit.com hosts
-      - Tickers: ~10 req/s per IP
-      - Kline: ~10 req/s per IP
+      - Tickers/Kline: ~10 req/s per IP
+    We hold a semaphore at 8 concurrent requests to stay well within bounds.
     """
 
     REST_BASE = "https://api.bybit.com"
@@ -63,11 +69,11 @@ class BybitV5Client:
         self._ws_trade = None
         self._subscriptions: Dict[str, Callable] = {}
         self._running = False
-        self._rate_limiter = asyncio.Semaphore(8)  # conservative: 8 concurrent
+        self._rate_limiter = asyncio.Semaphore(8)
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     #  REST helpers
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
@@ -76,9 +82,14 @@ class BybitV5Client:
         return self._session
 
     def _sign(self, params: str, timestamp: int) -> str:
-        payload = f"{timestamp}{self.cfg.api_key}{self.cfg.recv_window}{params}"
+        payload = (
+            f"{timestamp}{self.cfg.api_key}"
+            f"{self.cfg.recv_window}{params}"
+        )
         return hmac.new(
-            self.cfg.api_secret.encode(), payload.encode(), hashlib.sha256
+            self.cfg.api_secret.encode(),
+            payload.encode(),
+            hashlib.sha256,
         ).hexdigest()
 
     async def _rest_request(
@@ -118,12 +129,13 @@ class BybitV5Client:
                     })
 
             session = await self._get_session()
-            last_error = None
+            last_error: Optional[Exception] = None
 
             for attempt in range(self.cfg.max_retries):
                 try:
                     async with session.request(
-                        method, url,
+                        method,
+                        url,
                         headers=headers,
                         json=params if method.upper() != "GET" else None,
                     ) as resp:
@@ -131,7 +143,9 @@ class BybitV5Client:
 
                         if data.get("retCode") == 10006:
                             wait = self.cfg.retry_backoff ** (attempt + 1)
-                            logger.warning(f"Rate limited. Waiting {wait:.1f}s")
+                            logger.warning(
+                                f"Rate limited. Waiting {wait:.1f}s"
+                            )
                             await asyncio.sleep(wait)
                             continue
 
@@ -146,8 +160,9 @@ class BybitV5Client:
                     last_error = e
                     wait = self.cfg.retry_backoff ** (attempt + 1)
                     logger.warning(
-                        f"Request failed ({e}). Retry {attempt+1}/"
-                        f"{self.cfg.max_retries} in {wait:.1f}s"
+                        f"Request failed ({e}). "
+                        f"Retry {attempt + 1}/{self.cfg.max_retries} "
+                        f"in {wait:.1f}s"
                     )
                     await asyncio.sleep(wait)
 
@@ -168,29 +183,15 @@ class BybitV5Client:
         """
         Retrieve ALL active linear USDT perpetual symbols on Bybit.
 
-        This method paginates through /v5/market/instruments-info
-        (default limit 500 per page, cursor-based) to collect the
-        complete symbol list, then filters by quote coin, contract
-        type, and 24h turnover.
-
-        Args:
-            quote_coin:      "USDT" (default) or "USDC"
-            only_perpetual:  True → only LinearPerpetual contracts
-                             False → include dated futures too
-            min_turnover_24h: minimum 24h turnover in quote currency
-
-        Returns:
-            Sorted list of symbol strings (e.g. ["BTCUSDT", "ETHUSDT", ...])
+        Paginates /v5/market/instruments-info (500/page) then filters by
+        quote coin, contract type, and 24h turnover.
         """
         all_instruments: List[Dict] = []
         cursor: Optional[str] = None
         page = 0
 
         while True:
-            params: Dict[str, Any] = {
-                "category": "linear",
-                "limit": 500,
-            }
+            params: Dict[str, Any] = {"category": "linear", "limit": 500}
             if cursor:
                 params["cursor"] = cursor
 
@@ -199,7 +200,6 @@ class BybitV5Client:
             )
             result = data.get("result", {})
             batch = result.get("list", [])
-
             if not batch:
                 break
 
@@ -213,13 +213,14 @@ class BybitV5Client:
 
             if not cursor:
                 break
+            await asyncio.sleep(0.15)
 
-            await asyncio.sleep(0.15)  # gentle pacing
-
-        logger.info(f"Fetched {len(all_instruments)} total linear instruments")
+        logger.info(
+            f"Fetched {len(all_instruments)} total linear instruments"
+        )
 
         # Filter
-        symbols = []
+        symbols: List[str] = []
         for inst in all_instruments:
             if inst.get("quoteCoin") != quote_coin:
                 continue
@@ -233,78 +234,42 @@ class BybitV5Client:
         if min_turnover_24h > 0 and symbols:
             tickers = await self.get_all_tickers()
             turnover_map = {
-                t["symbol"]: float(t.get("turnover24h", 0))
+                t["symbol"]: float(t.get("turnover24h", 0) or 0)
                 for t in tickers
             }
             symbols = [
                 s for s in symbols
                 if turnover_map.get(s, 0) >= min_turnover_24h
             ]
-            symbols.sort(key=lambda s: turnover_map.get(s, 0), reverse=True)
+            symbols.sort(
+                key=lambda s: turnover_map.get(s, 0), reverse=True,
+            )
         else:
             symbols.sort()
 
         logger.info(
-            f"Filtered to {len(symbols)} {quote_coin} perpetuals "
-            f"with >{min_turnover_24h:,.0f} 24h turnover"
+            f"Filtered to {len(symbols)} {quote_coin} perpetuals with "
+            f">{min_turnover_24h:,.0f} 24h turnover"
         )
         return symbols
-
-    async def _await_op_response(ws, expected_op: str, timeout: float = 10.0) -> dict:
-        """
-        Read WebSocket messages until we see the response with the expected `op`.
-        Skips pongs, subscription confirmations, and unrelated messages.
-
-        Bybit V5 endpoints use two different auth response schemas:
-          - /v5/trade   → {"retCode": 0, "retMsg": "OK", "op": "auth", ...}
-          - /v5/private → {"success": true, "ret_msg": "", "op": "auth", ...}
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            remaining = max(0.5, deadline - time.time())
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            msg = json.loads(raw)
-            if msg.get("op") == expected_op:
-                return msg
-        raise TimeoutError(f"No '{expected_op}' response within {timeout}s")
-
-
-    def _is_auth_ok(resp: dict) -> tuple[bool, str]:
-        """
-        Check auth response from either WS endpoint.
-        Returns (ok, error_message).
-        """
-        # Trade WS style
-        if "retCode" in resp:
-            ok = resp.get("retCode") == 0
-            return ok, resp.get("retMsg", "") if not ok else ""
-
-        # Private WS style
-        if "success" in resp:
-            ok = bool(resp.get("success"))
-            return ok, resp.get("ret_msg", "") if not ok else ""
-
-        # Neither — unknown schema
-        return False, f"unrecognised auth response: {resp}"
 
     async def get_all_tickers(
         self, category: str = "linear"
     ) -> List[Dict]:
-        """
-        Fetch ALL tickers in one request (no symbol parameter).
-        The V5 tickers endpoint returns the full list when symbol is omitted.
-        """
+        """Fetch ALL tickers in one request (omit `symbol` param)."""
         data = await self._rest_request(
-            "GET", "/v5/market/tickers",
-            params={"category": category},
+            "GET", "/v5/market/tickers", params={"category": category},
         )
         return data.get("result", {}).get("list", [])
 
     # ================================================================== #
-    #  Market Data (V5 public)
+    #  Market data (V5 public)
     # ================================================================== #
     async def get_klines(
-        self, symbol: str, interval: str = "60", limit: int = 200,
+        self,
+        symbol: str,
+        interval: str = "60",
+        limit: int = 200,
         category: Optional[str] = None,
     ) -> List[List]:
         """
@@ -324,7 +289,10 @@ class BybitV5Client:
         return data.get("result", {}).get("list", [])
 
     async def get_open_interest(
-        self, symbol: str, interval_time: str = "1h", limit: int = 50,
+        self,
+        symbol: str,
+        interval_time: str = "1h",
+        limit: int = 50,
     ) -> List[Dict]:
         """GET /v5/market/open-interest — intervalTime: 5min,15min,30min,1h,4h,1d"""
         data = await self._rest_request(
@@ -341,10 +309,7 @@ class BybitV5Client:
     async def get_account_ratio(
         self, symbol: str, period: str = "1h", limit: int = 50,
     ) -> List[Dict]:
-        """
-        GET /v5/market/account-ratio — Account Long/Short Ratio.
-        period: 5min,15min,30min,1h,4h,1d
-        """
+        """GET /v5/market/account-ratio — Account Long/Short Ratio."""
         data = await self._rest_request(
             "GET", "/v5/market/account-ratio",
             params={
@@ -380,15 +345,22 @@ class BybitV5Client:
     # ================================================================== #
     #  Account / Position (V5 private)
     # ================================================================== #
-    async def get_wallet_balance(self, account_type: str = "UNIFIED") -> Dict:
+    async def get_wallet_balance(
+        self, account_type: str = "UNIFIED",
+    ) -> Dict:
         data = await self._rest_request(
             "GET", "/v5/account/wallet-balance",
             params={"accountType": account_type}, signed=True,
         )
         return data.get("result", {})
 
-    async def get_positions(self, symbol: Optional[str] = None) -> List[Dict]:
-        params = {"category": self.cfg.category, "settleCoin": "USDT"}
+    async def get_positions(
+        self, symbol: Optional[str] = None,
+    ) -> List[Dict]:
+        params: Dict[str, Any] = {
+            "category": self.cfg.category,
+            "settleCoin": "USDT",
+        }
         if symbol:
             params["symbol"] = symbol
         data = await self._rest_request(
@@ -409,12 +381,12 @@ class BybitV5Client:
         )
 
     # ================================================================== #
-    #  Order Execution (WS Trade API)
+    #  Order execution (WS Trade API)
     # ================================================================== #
     async def place_order_ws(
         self,
         symbol: str,
-        side: str,                # "Buy" | "Sell"
+        side: str,                 # "Buy" | "Sell"
         qty: float,
         order_type: str = "Market",
         price: Optional[float] = None,
@@ -433,8 +405,7 @@ class BybitV5Client:
         if self._ws_trade is None or self._ws_trade.closed:
             await self._connect_ws_trade()
 
-        req_id = f"order_{int(time.time()*1000)}"
-
+        req_id = f"order_{int(time.time() * 1000)}"
         payload = {
             "op": "order.create",
             "args": [{
@@ -457,14 +428,16 @@ class BybitV5Client:
             payload["args"][0]["stopLoss"] = str(stop_loss)
             payload["args"][0]["slTriggerBy"] = sl_trigger_by
             payload["args"][0]["slOrderType"] = "Market"
-        if take_profit or stop_loss:
+        if take_profit is not None or stop_loss is not None:
             payload["args"][0]["tpslMode"] = tpsl_mode
         if price is not None and order_type == "Limit":
             payload["args"][0]["price"] = str(price)
 
         logger.info(f"WS place_order: {json.dumps(payload)}")
         await self._ws_trade.send(json.dumps(payload))
-        response = await asyncio.wait_for(self._ws_trade.recv(), timeout=10)
+        response = await asyncio.wait_for(
+            self._ws_trade.recv(), timeout=10,
+        )
         return json.loads(response)
 
     async def set_trading_stop(
@@ -477,7 +450,7 @@ class BybitV5Client:
         sl_trigger_by: str = "LastPrice",
     ) -> Dict:
         """Update TP/SL for an existing position via REST."""
-        params = {
+        params: Dict[str, Any] = {
             "category": self.cfg.category,
             "symbol": symbol,
             "tpslMode": "Full",
@@ -502,9 +475,56 @@ class BybitV5Client:
         """Emergency close: market order in opposite direction."""
         close_side = "Sell" if side == "Buy" else "Buy"
         return await self.place_order_ws(
-            symbol=symbol, side=close_side, qty=qty,
-            order_type="Market", reduce_only=True,
+            symbol=symbol,
+            side=close_side,
+            qty=qty,
+            order_type="Market",
+            reduce_only=True,
         )
+
+    # ================================================================== #
+    #  WebSocket auth helpers
+    # ================================================================== #
+    async def _await_op_response(
+        self,
+        ws,
+        expected_op: str,
+        timeout: float = 10.0,
+    ) -> dict:
+        """
+        Read WebSocket messages until we see the response with the
+        expected `op`. Skips pongs and unrelated messages.
+
+        Bybit V5 endpoints use different auth response schemas:
+          - /v5/trade   → {"retCode": 0, "retMsg": "OK", "op": "auth", ...}
+          - /v5/private → {"success": true, "ret_msg": "", "op": "auth", ...}
+        """
+        timeout = float(timeout)
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            remaining = max(0.5, deadline - time.time())
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            msg = json.loads(raw)
+            if msg.get("op") == expected_op:
+                return msg
+
+        raise TimeoutError(
+            f"No '{expected_op}' response within {timeout:.1f}s"
+        )
+
+    def _is_auth_ok(self, resp: dict) -> tuple:
+        """
+        Check auth response from either WS endpoint.
+        Returns (ok: bool, error_message: str).
+        """
+        if "retCode" in resp:                     # Trade WS schema
+            ok = resp.get("retCode") == 0
+            return ok, "" if ok else resp.get("retMsg", "")
+        if "success" in resp:                     # Private WS schema
+            ok = bool(resp.get("success"))
+            return ok, "" if ok else resp.get("ret_msg", "")
+        return False, f"unrecognised auth response: {resp}"
 
     # ================================================================== #
     #  WebSocket connections
@@ -527,10 +547,14 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        auth_resp = await self._await_op_response(self._ws_trade, "auth")
-        ok, err = _is_auth_ok(auth_resp)
+        auth_resp = await self._await_op_response(
+            self._ws_trade, "auth",
+        )
+        ok, err = self._is_auth_ok(auth_resp)
         if not ok:
-            raise ConnectionError(f"WS Trade auth failed: {err} | raw={auth_resp}")
+            raise ConnectionError(
+                f"WS Trade auth failed: {err} | raw={auth_resp}"
+            )
         logger.info("WS Trade authenticated successfully")
 
     async def _connect_ws_private(self):
@@ -551,11 +575,15 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        # NOTE: Private WS uses `success` / `ret_msg`, NOT `retCode` / `retMsg`.
-        auth_resp = await _await_op_response(self._ws_private, "auth")
-        ok, err = _is_auth_ok(auth_resp)
+        # Private WS returns `success` / `ret_msg`, NOT `retCode` / `retMsg`.
+        auth_resp = await self._await_op_response(
+            self._ws_private, "auth",
+        )
+        ok, err = self._is_auth_ok(auth_resp)
         if not ok:
-            raise ConnectionError(f"WS Private auth failed: {err} | raw={auth_resp}")
+            raise ConnectionError(
+                f"WS Private auth failed: {err} | raw={auth_resp}"
+            )
         logger.info("WS Private authenticated successfully")
 
     async def subscribe_private(
@@ -564,6 +592,7 @@ class BybitV5Client:
         """Subscribe to private topics: position, order, execution, wallet."""
         if self._ws_private is None or self._ws_private.closed:
             await self._connect_ws_private()
+
         await self._ws_private.send(
             json.dumps({"op": "subscribe", "args": topics})
         )
@@ -572,7 +601,11 @@ class BybitV5Client:
         asyncio.create_task(self._private_listener())
 
     async def _private_listener(self):
-        while self._running and self._ws_private and not self._ws_private.closed:
+        while (
+            self._running
+            and self._ws_private is not None
+            and not self._ws_private.closed
+        ):
             try:
                 msg = json.loads(await self._ws_private.recv())
                 topic = msg.get("topic", "")
@@ -581,16 +614,29 @@ class BybitV5Client:
             except websockets.ConnectionClosed:
                 logger.warning("Private WS closed. Reconnecting...")
                 await asyncio.sleep(3)
-                await self._connect_ws_private()
+                try:
+                    await self._connect_ws_private()
+                except Exception as e:
+                    logger.error(f"Private WS reconnect failed: {e}")
+                    await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Private WS listener error: {e}")
+                await asyncio.sleep(1)
 
+    # ================================================================== #
+    #  Lifecycle
+    # ================================================================== #
     async def start(self):
         self._running = True
         await self._connect_ws_trade()
 
     async def stop(self):
         self._running = False
-        for ws in [self._ws_public, self._ws_private, self._ws_trade]:
-            if ws and not ws.closed:
-                await ws.close()
-        if self._session and not self._session.closed:
+        for ws in (self._ws_public, self._ws_private, self._ws_trade):
+            if ws is not None and not ws.closed:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        if self._session is not None and not self._session.closed:
             await self._session.close()
