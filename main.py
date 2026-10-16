@@ -1,179 +1,485 @@
-import ccxt
-import time
-import schedule
-import random
-import os
-import pandas as pd
-import pandas_ta as ta
+"""
+main.py
+Bybit Quant Bot v9.1 — Async orchestrator with FULL-PAIR scanning.
+
+Wires together:
+  - V5 client with get_all_linear_symbols() pagination
+  - DerivativeAnalyzer (CVD, OI, L/S ratio)
+  - CompositeQuantEngine (Zeta, basis, volume anomaly)
+  - ConfidenceScorer (calibrated, high-confidence gate)
+  - DeepSeekAgent (LLM analysis)
+  - TradeExecutor (WS orders + position monitor)
+  - AutoTuner + OutcomeTracker (07:00 daily improvement)
+  - Discord notifications
+"""
+import asyncio
+import json
+import logging
+import signal
+import sys
+from datetime import datetime, timedelta
+
 import numpy as np
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from modules.config_loader import CONFIG
-from modules.database import init_db, get_active_signals
-from modules.technicals import get_technicals, detect_divergence
-from modules.quant import calculate_metrics, check_fakeout
-from modules.derivatives import analyze_derivatives
-from modules.smc import analyze_smc
-from modules.patterns import find_pattern
-from modules.discord_bot import send_alert, update_status_dashboard, run_fast_update, send_scan_completion
+import pandas as pd
 
-exchange = ccxt.bybit({'apiKey': CONFIG['api']['bybit_key'], 'secret': CONFIG['api']['bybit_secret'], 'options': {'defaultType': 'swap'}})
+from core.bybit_client import BybitV5Client, BybitConfig
+from analysis.derivatives import DerivativeAnalyzer
+from analysis.confidence import ConfidenceScorer
+from analysis.quant_composite import CompositeQuantEngine
+from agent.deepseek_agent import DeepSeekAgent, DeepSeekConfig
+from execution.trade_executor import TradeExecutor, TradeSignal
+from execution.risk_manager import RiskManager
+from learning.signal_journal import SignalJournal
+from learning.outcome_tracker import OutcomeTracker
+from learning.auto_tuner import AutoTuner
+from notification.discord_bot import DiscordNotifier
+from persistence.database import Database
 
-def get_btc_bias():
-    try:
-        bars = exchange.fetch_ohlcv('BTC/USDT', '1d', limit=100)
-        if not bars: return "Sideways"
-        df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
-        df['ema13'] = ta.ema(df['c'], length=13)
-        df['ema21'] = ta.ema(df['c'], length=21)
-        curr = df.iloc[-1]
-        return "Bullish" if curr['ema13'] > curr['ema21'] else "Bearish"
-    except: return "Sideways"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot_v9.log"),
+    ],
+)
+logger = logging.getLogger("main")
 
-def calculate_rr(entry, sl, tp3):
-    if entry <= 0 or sl <= 0 or tp3 <= 0: return 0.0
-    risk = abs(entry - sl)
-    return round(abs(tp3 - entry) / risk, 2) if risk > 0 else 0.0
 
-def analyze_ticker(symbol, timeframe, btc_bias, active_signals):
-    # 1. DUPLICATE CHECK
-    if (symbol, timeframe) in active_signals: return None
-    
-    try:
-        ticker_info = exchange.fetch_ticker(symbol)
-        if "ST" in ticker_info.get('info', {}).get('symbol', ''): return None
-        
-        min_candles = CONFIG['system'].get('min_candles_analysis', 150)
-        bars = exchange.fetch_ohlcv(symbol, timeframe, limit=min_candles + 50)
-        if not bars or len(bars) < min_candles: return None
-            
-        df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # 2. Technicals & Pattern
-        df = get_technicals(df)
-        pattern = find_pattern(df)
-        if not pattern: return None
-        side = CONFIG['pattern_signals'].get(pattern)
-        
-        # 3. SMC Analysis (Optional Filter)
-        valid_smc, smc_score, smc_reasons = analyze_smc(df, side)
-        if smc_score < CONFIG['strategy'].get('min_smc_score', 0):
-            # print(f"❌ {symbol} rejected: SMC Score too low ({smc_score})")
-            return None
-        # if not valid_smc: return None  # Un-comment for strict SMC
+class QuantBotV9:
+    def __init__(self, config_path: str = "config.json"):
+        with open(config_path) as f:
+            self.config = json.load(f)
 
-        # 4. Quant & Deriv Metrics
-        df, basis, z_score, zeta_score, obi, quant_score, quant_reasons = calculate_metrics(df, ticker_info)
-        valid_deriv, deriv_score, deriv_reasons = analyze_derivatives(df, ticker_info, side)
-        if not valid_deriv: return None
+        self.client = BybitV5Client(BybitConfig(
+            api_key=self.config["api"]["bybit_key"],
+            api_secret=self.config["api"]["bybit_secret"],
+            testnet=self.config["api"].get("testnet", False),
+            category="linear",
+        ))
 
-        if deriv_score < CONFIG['strategy'].get('min_deriv_score', 0):
-            # print(f"❌ {symbol} rejected: Deriv Score too low ({deriv_score})")
-            return None
-        
-        # 5. Scores & Bias
-        div_score, div_msg = detect_divergence(df)
-        tech_score = 3 + div_score
-        tech_reasons = [f"Pattern: {pattern}", div_msg] + smc_reasons
+        self.db = Database(self.config["database"])
+        self.journal = SignalJournal(self.db)
 
-        total_score = tech_score + smc_score + quant_score + deriv_score
-        
-        if "Bearish" in btc_bias and side == "Long": return None
-        if "Bullish" in btc_bias and side == "Short": return None
-        
-        valid_fo, fo_msg = check_fakeout(df, CONFIG['indicators']['min_rvol'])
-        if not valid_fo: return None
+        self.derivatives = DerivativeAnalyzer(self.client)
+        self.scorer = ConfidenceScorer(
+            min_raw_threshold=self.config["strategy"]["min_raw_threshold"],
+            min_calibrated=self.config["strategy"]["min_calibrated"],
+        )
+        self.composite_engine = CompositeQuantEngine(
+            self.client,
+            weights=self.config.get("strategy", {}).get("composite_weights"),
+        )
 
-        if tech_score < CONFIG['strategy']['min_tech_score']: return None
+        self.agent = DeepSeekAgent(DeepSeekConfig(
+            api_key=self.config["deepseek"]["api_key"],
+            model=self.config["deepseek"].get("model", "deepseek-chat"),
+        ))
 
-        # 6. Setup Calculation
-        s = CONFIG['setup']
-        swing_high = df['high'].iloc[-50:].max()
-        swing_low = df['low'].iloc[-50:].min()
-        rng = swing_high - swing_low
-        
-        if side == 'Long':
-            entry = (swing_high - (rng * s['fib_entry_start']) + swing_high - (rng * s['fib_entry_end'])) / 2
-            sl = swing_low - (rng * s['fib_sl'])
-            tp1, tp2, tp3 = swing_low + rng, swing_low + (rng*1.618), swing_low + (rng*2.618)
-        else:
-            entry = (swing_low + (rng * s['fib_entry_start']) + swing_low + (rng * s['fib_entry_end'])) / 2
-            sl = swing_high + (rng * s['fib_sl'])
-            tp1, tp2, tp3 = swing_high - rng, swing_high - (rng*1.618), swing_high - (rng*2.618)
-            
-        rr = calculate_rr(entry, sl, tp3)
-        if rr < CONFIG['strategy'].get('risk_reward_min', 2.0): return None
-        
-        df['funding'] = float(ticker_info.get('info', {}).get('fundingRate', 0))
-        
-        # 7. Return Data (Type Casted)
-        return {
-            "Symbol": symbol, "Side": side, "Timeframe": timeframe, "Pattern": pattern,
-            "Entry": float(entry), "SL": float(sl), "TP1": float(tp1), "TP2": float(tp2), "TP3": float(tp3), "RR": float(rr),
-            "Tech_Score": int(tech_score), "Quant_Score": int(quant_score), 
-            "Deriv_Score": int(deriv_score), "SMC_Score": int(smc_score),
-            "Basis": float(basis), "Z_Score": float(z_score), "Zeta_Score": float(zeta_score), "OBI": float(obi),
-            "BTC_Bias": btc_bias, "Reason": pattern, 
-            "Tech_Reasons": ", ".join(tech_reasons),
-            "Quant_Reasons": ", ".join(quant_reasons),
-            "SMC_Reasons": ", ".join([r for r in smc_reasons if r]), # <--- NEW FIELD
-            "Deriv_Reasons": ", ".join(deriv_reasons), "df": df
+        self.risk_manager = RiskManager(self.config["risk"])
+        self.executor = TradeExecutor(
+            self.client, self.risk_manager, self.config["execution"],
+        )
+
+        self.outcome_tracker = OutcomeTracker(self.client, self.journal)
+        self.auto_tuner = AutoTuner(self.config["auto_tune"], self.scorer)
+        self.notifier = DiscordNotifier(self.config["api"])
+
+        self._running = False
+        self._daily_task = None
+        self._scan_task = None
+
+    async def start(self):
+        logger.info("=" * 60)
+        logger.info("Bybit Quant Bot v9.1 starting — FULL-PAIR SCANNER")
+        logger.info("=" * 60)
+
+        self._running = True
+        await self.client.start()
+        await self.db.connect()
+        await self.executor.start_monitor()
+
+        self._daily_task = asyncio.create_task(self._daily_scheduler())
+        self._scan_task = asyncio.create_task(self._scan_loop())
+
+        await self.client.subscribe_private(
+            ["position", "order", "execution", "wallet"],
+            self._on_private_message,
+        )
+
+        logger.info("All subsystems started.")
+        try:
+            await asyncio.gather(self._daily_task, self._scan_task)
+        except asyncio.CancelledError:
+            pass
+
+    async def stop(self):
+        logger.info("Shutting down...")
+        self._running = False
+        await self.executor.stop_monitor()
+        await self.executor.close_all_positions()
+        await self.client.stop()
+        await self.agent.close()
+        await self.db.close()
+        logger.info("Shutdown complete.")
+
+    # ================================================================== #
+    #  FULL-PAIR SCAN LOOP
+    # ================================================================== #
+    async def _scan_loop(self):
+        """
+        Scans ALL Bybit USDT perpetual pairs.
+
+        Each cycle:
+          1. Fetch every active LinearPerpetual symbol via pagination.
+          2. Filter by 24h turnover (default >5M USDT).
+          3. Analyse each symbol concurrently (bounded by semaphore).
+        """
+        interval = self.config["system"].get("check_interval_hours", 1)
+        scan_top_n = self.config["system"].get("scan_top_n", 0)
+        min_turnover = self.config["system"].get(
+            "min_turnover_24h", 5_000_000,
+        )
+
+        while self._running:
+            try:
+                logger.info("Fetching full Bybit symbol list...")
+                all_symbols = await self.client.get_all_linear_symbols(
+                    quote_coin="USDT",
+                    only_perpetual=True,
+                    min_turnover_24h=min_turnover,
+                )
+
+                if scan_top_n > 0:
+                    symbols = all_symbols[:scan_top_n]
+                else:
+                    symbols = all_symbols
+
+                logger.info(
+                    f"Scanning {len(symbols)} symbols "
+                    f"(of {len(all_symbols)} total USDT perps)"
+                )
+
+                semaphore = asyncio.Semaphore(
+                    self.config["system"].get("max_concurrent", 10)
+                )
+
+                async def analyse_symbol(sym):
+                    async with semaphore:
+                        try:
+                            await self._analyse_and_signal(sym)
+                        except Exception as e:
+                            logger.error(
+                                f"Analysis failed for {sym}: {e}",
+                                exc_info=False,
+                            )
+
+                await asyncio.gather(
+                    *[analyse_symbol(s) for s in symbols]
+                )
+                logger.info(f"Scan complete. Next in {interval}h.")
+
+            except Exception as e:
+                logger.error(f"Scan loop error: {e}", exc_info=True)
+
+            await asyncio.sleep(interval * 3600)
+
+    # ================================================================== #
+    #  Per-symbol analysis pipeline
+    # ================================================================== #
+    async def _analyse_and_signal(self, symbol: str):
+        """Full analysis pipeline for a single symbol."""
+        klines = await self.client.get_klines(
+            symbol, interval="60", limit=200,
+        )
+        if not klines or len(klines) < 100:
+            return
+
+        df = pd.DataFrame(
+            klines,
+            columns=["ts", "open", "high", "low", "close", "volume", "turnover"],
+        )
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.sort_values("ts").reset_index(drop=True)
+
+        indicators = self._compute_indicators(df)
+
+        deriv = await self.derivatives.get_full_snapshot(symbol)
+
+        # Composite quant engine (Zeta, basis, volume)
+        composite = await self.composite_engine.compute(
+            symbol=symbol,
+            df=df,
+            indicators=indicators,
+            derivative_snapshot=deriv,
+            bar_interval_hours=1.0,
+        )
+
+        bias = composite.direction if composite.direction != "neutral" else (
+            "long" if indicators.get("ema_9", 0) > indicators.get("ema_21", 0)
+            else "short"
+        )
+
+        patterns = self._detect_patterns(df)
+
+        prelim = self.scorer.compute(
+            symbol=symbol,
+            klines_df=df,
+            indicators=indicators,
+            deriv_snapshot=deriv,
+            patterns_detected=patterns,
+            bias=bias,
+            llm_response=None,
+            composite=composite,
+        )
+        if prelim.raw_total < 40:
+            return
+
+        market_context = {
+            "symbol": symbol,
+            "price": float(df["close"].iloc[-1]),
+            "bias": bias,
+            "indicators": indicators,
+            "derivatives": {
+                "cvd": deriv.cvd,
+                "cvd_slope": deriv.cvd_slope,
+                "cvd_divergence": deriv.cvd_divergence,
+                "oi": deriv.oi,
+                "oi_change_1h": deriv.oi_change_1h,
+                "oi_change_4h": deriv.oi_change_4h,
+                "oi_divergence": deriv.oi_divergence,
+                "funding_rate": deriv.funding_rate,
+                "account_ls_ratio": deriv.account_ls_ratio,
+                "top_trader_ls_ratio": deriv.top_trader_ls_ratio,
+                "ls_ratio_divergence": deriv.ls_ratio_divergence,
+                "smart_money_bias": deriv.smart_money_bias,
+            },
+            "quant_composite": {
+                "total_score": composite.total_score,
+                "direction": composite.direction,
+                "conviction": composite.conviction,
+                "agreement_ratio": composite.agreement_ratio,
+                "conflicting_components": composite.conflicting_components,
+                "mean_reversion": {
+                    "zeta": composite.mean_reversion.zeta,
+                    "z_score": composite.mean_reversion.z_score,
+                    "phi": composite.mean_reversion.phi,
+                    "half_life_hours": composite.mean_reversion.half_life_hours,
+                    "hurst": composite.mean_reversion.hurst,
+                    "regime": composite.mean_reversion.regime,
+                    "adf_pvalue": composite.mean_reversion.adf_pvalue,
+                    "is_stationary": composite.mean_reversion.is_stationary,
+                },
+                "basis": {
+                    "basis_pct": composite.basis.basis_pct,
+                    "funding_rate": composite.basis.funding_rate,
+                    "funding_annualized_pct": composite.basis.funding_annualized,
+                    "regime": composite.basis.regime,
+                    "signal_bias": composite.basis.signal_bias,
+                },
+                "volume": {
+                    "rvol": composite.volume.rvol,
+                    "z_score": composite.volume.z_score,
+                    "percentile_rank": composite.volume.percentile_rank,
+                    "anomaly_level": composite.volume.anomaly_level,
+                    "vwpd": composite.volume.vwpd,
+                    "divergence": composite.volume.divergence,
+                },
+            },
+            "patterns": patterns,
+            "preliminary_score": prelim.raw_total,
         }
-    except: return None
 
-def scan():
-    start_time = time.time()
-    print(f"\n[{pd.Timestamp.now()}] 🔭 Scanning... Mode: {os.getenv('BOT_ENV', 'PROD')}")
-    btc_bias = get_btc_bias()
-    print(f"📊 BTC Bias: {btc_bias}")
-    
-    active_signals = get_active_signals()
-    print(f"🛡️ Active Signals Ignored: {len(active_signals)}")
-    signal_count = 0 
-    
+        llm_response = await self.agent.analyse(symbol, market_context)
+
+        final = self.scorer.compute(
+            symbol=symbol,
+            klines_df=df,
+            indicators=indicators,
+            deriv_snapshot=deriv,
+            patterns_detected=patterns,
+            bias=bias,
+            llm_response=llm_response,
+            composite=composite,
+        )
+
+        signal_id = await self.journal.log_signal({
+            "symbol": symbol,
+            "direction": bias,
+            "timestamp": datetime.utcnow().isoformat(),
+            "entry_price": float(df["close"].iloc[-1]),
+            "raw_score": final.raw_total,
+            "calibrated_confidence": final.calibrated_confidence,
+            "is_high_confidence": final.is_high_confidence,
+            "gate_reasons": final.gate_reasons,
+            "llm_response": llm_response,
+            "indicators": indicators,
+            "composite_score": composite.total_score,
+            "composite_direction": composite.direction,
+            "composite_conviction": composite.conviction,
+            "zeta": composite.mean_reversion.zeta,
+            "hurst": composite.mean_reversion.hurst,
+            "half_life_hours": composite.mean_reversion.half_life_hours,
+            "basis_pct": composite.basis.basis_pct,
+            "funding_annualized_pct": composite.basis.funding_annualized,
+            "volume_zscore": composite.volume.z_score,
+            "volume_anomaly_level": composite.volume.anomaly_level,
+        })
+
+        if not final.is_high_confidence:
+            logger.debug(
+                f"{symbol}: not high confidence "
+                f"(raw={final.raw_total:.1f}, "
+                f"cal={final.calibrated_confidence:.2f})"
+            )
+            return
+
+        entry = float(df["close"].iloc[-1])
+        atr = indicators.get("atr", entry * 0.01)
+        if bias == "long":
+            sl = entry - 1.5 * atr
+            tp1 = entry + 3.0 * atr
+        else:
+            sl = entry + 1.5 * atr
+            tp1 = entry - 3.0 * atr
+
+        signal = TradeSignal(
+            symbol=symbol,
+            direction=bias,
+            entry_price=entry,
+            stop_loss=round(sl, 6),
+            take_profit_1=round(tp1, 6),
+            confidence=final.calibrated_confidence,
+            leverage=self.config["risk"].get("default_leverage", 5),
+            reason=f"Raw={final.raw_total:.0f} "
+                   f"Composite={composite.total_score:.2f} "
+                   f"Conviction={composite.conviction}",
+            metadata={
+                "signal_id": signal_id,
+                "llm": llm_response,
+                "composite": composite.total_score,
+            },
+        )
+
+        result = await self.executor.execute_signal(signal)
+        if result["status"] == "filled":
+            await self.notifier.send_signal_alert(
+                signal, final, llm_response,
+            )
+            await self.journal.mark_executed(signal_id, result)
+
+    # ================================================================== #
+    #  Indicator helpers
+    # ================================================================== #
+    def _compute_indicators(self, df) -> dict:
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        ema_9 = close.ewm(span=9).mean().iloc[-1]
+        ema_21 = close.ewm(span=21).mean().iloc[-1]
+        ema_50 = close.ewm(span=50).mean().iloc[-1]
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        rsi = (100 - 100 / (1 + rs)).iloc[-1]
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        rvol = df["volume"].iloc[-1] / avg_vol if avg_vol > 0 else 1.0
+        return {
+            "ema_9": float(ema_9),
+            "ema_21": float(ema_21),
+            "ema_50": float(ema_50),
+            "rsi": float(rsi),
+            "atr": float(atr),
+            "rvol": float(rvol),
+        }
+
+    def _detect_patterns(self, df) -> list:
+        patterns = []
+        close = df["close"].values
+        if len(close) >= 40:
+            recent = close[-40:]
+            lows = [
+                i for i in range(1, len(recent) - 1)
+                if recent[i] < recent[i - 1] and recent[i] < recent[i + 1]
+            ]
+            if len(lows) >= 2:
+                if abs(recent[lows[-1]] - recent[lows[-2]]) / recent[lows[-2]] < 0.02:
+                    patterns.append("double_bottom")
+        return patterns
+
+    # ================================================================== #
+    #  Daily 07:00 scheduler
+    # ================================================================== #
+    async def _daily_scheduler(self):
+        target_hour = self.config["auto_tune"].get("run_hour", 7)
+        while self._running:
+            now = datetime.utcnow()
+            target = now.replace(
+                hour=target_hour, minute=0, second=0, microsecond=0,
+            )
+            if target <= now:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            logger.info(
+                f"Next auto-improvement in {wait_seconds/3600:.1f}h"
+            )
+            await asyncio.sleep(wait_seconds)
+            try:
+                logger.info("DAILY AUTO-IMPROVEMENT STARTING")
+                await self.outcome_tracker.run_daily_check()
+                results = await self.auto_tuner.run_daily_improvement(
+                    self.journal, None,
+                )
+                if results:
+                    await self.notifier.send_tuning_report(results)
+                logger.info(
+                    f"Auto-improvement complete. "
+                    f"{len(results)} adjustments applied."
+                )
+            except Exception as e:
+                logger.error(
+                    f"Daily improvement failed: {e}", exc_info=True,
+                )
+
+    async def _on_private_message(self, msg: dict):
+        topic = msg.get("topic", "")
+        if topic == "position":
+            for pos in msg.get("data", []):
+                logger.debug(
+                    f"Position update: {pos.get('symbol')} "
+                    f"size={pos.get('size')}"
+                )
+        elif topic == "execution":
+            for ex in msg.get("data", []):
+                logger.info(
+                    f"Execution: {ex.get('symbol')} {ex.get('side')} "
+                    f"{ex.get('execQty')}"
+                )
+
+
+async def main():
+    bot = QuantBotV9()
+    loop = asyncio.get_event_loop()
+
+    def shutdown():
+        asyncio.create_task(bot.stop())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown)
+
     try:
-        mkts = exchange.load_markets()
-        
-        # 🚫 LIST OF STABLECOINS TO IGNORE (As Base Currency)
-        STABLECOINS = ['USDC', 'USDT', 'DAI', 'FDUSD', 'USDD', 'USDE', 'TUSD', 'BUSD', 'PYUSD', 'USDS', 'EUR', 'USD']
+        await bot.start()
+    except KeyboardInterrupt:
+        await bot.stop()
 
-        # Filter Logic:
-        # 1. Must be a Swap (Perpetual)
-        # 2. Quote currency must be USDT
-        # 3. Must be Active (trading enabled)
-        # 4. Base currency MUST NOT be a stablecoin
-        syms = [
-            s for s in mkts 
-            if mkts[s].get('swap') 
-            and mkts[s]['quote'] == 'USDT' 
-            and mkts[s].get('active')
-            and mkts[s]['base'] not in STABLECOINS # <--- STABLECOIN FILTER
-        ]
-        
-        random.shuffle(syms) 
-        
-        print(f"🔍 Scanning {len(syms)} valid pairs (Stables removed)...")
-
-        for tf in reversed(CONFIG['system']['timeframes']):
-            with ThreadPoolExecutor(max_workers=CONFIG['system']['max_threads']) as ex:
-                futures = [ex.submit(analyze_ticker, s, tf, btc_bias, active_signals) for s in syms]
-                for f in as_completed(futures):
-                    res = f.result()
-                    if res: 
-                        success = send_alert(res)
-                        if success: signal_count += 1
-                        
-    except Exception as e: print(f"Scan Error: {e}")
-    finally:
-        duration = time.time() - start_time
-        print(f"✅ Scan Finished in {duration:.2f}s. Signals: {signal_count}")
-        send_scan_completion(signal_count, duration, btc_bias)
 
 if __name__ == "__main__":
-    init_db()
-    scan()
-    schedule.every(CONFIG['system']['check_interval_hours']).hours.do(scan)
-    schedule.every(1).minutes.do(run_fast_update)
-    print("🚀 Bot Started.")
-    while True: schedule.run_pending(); time.sleep(1)
+    asyncio.run(main())

@@ -1,3 +1,7 @@
 #!/bin/bash
-sudo systemctl restart bybit_bot
-echo "Bot Restarted at $(date)" >> /var/log/bot_restart.log
+set -e
+cd /home/ubuntu/bybit_quant_v9
+pkill -f "python main.py" || true
+sleep 2
+nohup ./venv/bin/python main.py > bot_v9.log 2>&1 &
+echo "Bot restarted (PID $!)"

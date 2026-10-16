@@ -1,15 +1,16 @@
 [Unit]
-Description=Bybit Quant Bot V8.0
+Description=Bybit Quant Bot v9.1
 After=network.target postgresql.service
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/bybit_bot_v8
-ExecStart=/opt/bybit_bot_v8/venv/bin/python main.py
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bybit_quant_v9
+ExecStart=/home/ubuntu/bybit_quant_v9/venv/bin/python main.py
 Restart=always
-RestartSec=5
-Environment="BOT_ENV=production"
+RestartSec=10
+StandardOutput=append:/var/log/bybit_bot.log
+StandardError=append:/var/log/bybit_bot.err
 
 [Install]
 WantedBy=multi-user.target

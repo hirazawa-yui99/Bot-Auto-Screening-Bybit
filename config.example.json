@@ -1,59 +1,78 @@
 {
-    "api": {
-        "discord_webhook": "YOUR_WEBHOOK_URL",
-        "discord_live_webhook": "YOUR_LIVE_WEBHOOK_URL",
-        "discord_dashboard_webhook": "YOUR_DASHBOARD_WEBHOOK_URL",
-        "bybit_key": "YOUR_BYBIT_KEY",
-        "bybit_secret": "YOUR_BYBIT_SECRET",
-        "discord_server_id": "YOUR_SERVER_ID",
-        "discord_role_id": "YOUR_ROLE_ID"
+  "api": {
+    "bybit_key": "YOUR_V5_API_KEY",
+    "bybit_secret": "YOUR_V5_API_SECRET",
+    "testnet": false,
+    "discord_webhook": "https://discord.com/api/webhooks/...",
+    "discord_live_webhook": "https://discord.com/api/webhooks/...",
+    "discord_dashboard_webhook": "https://discord.com/api/webhooks/..."
+  },
+  "deepseek": {
+    "api_key": "sk-...",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "temperature": 0.3,
+    "max_tokens": 1500
+  },
+  "database": {
+    "host": "localhost",
+    "database": "bybit_bot_v9",
+    "user": "postgres",
+    "password": "",
+    "port": "5432"
+  },
+  "system": {
+    "timezone": "UTC",
+    "check_interval_hours": 1,
+    "max_threads": 10,
+    "max_concurrent": 10,
+    "scan_top_n": 0,
+    "min_turnover_24h": 5000000
+  },
+  "strategy": {
+    "min_raw_threshold": 65.0,
+    "min_calibrated": 0.72,
+    "risk_reward_min": 2.5,
+    "composite_weights": {
+      "mean_reversion": 0.25,
+      "basis": 0.15,
+      "volume": 0.15,
+      "derivatives": 0.30,
+      "momentum": 0.15
     },
-    "database": {
-        "host": "localhost",
-        "database": "bybit_bot",
-        "user": "postgres",
-        "password": "YOUR_DB_PASSWORD",
-        "port": "5432"
+    "mean_reversion": {
+      "min_samples": 60,
+      "hurst_stationary_threshold": 0.45,
+      "zeta_entry_threshold": 1.5,
+      "adf_pvalue_max": 0.10
     },
-    "system": {
-        "timezone": "Asia/Jakarta",
-        "max_threads": 20,
-        "check_interval_hours": 1,
-        "timeframes": ["1h", "4h", "1d", "1w"]
+    "volume_anomaly": {
+      "baseline_window": 50,
+      "z_high_threshold": 2.0,
+      "z_extreme_threshold": 3.0
     },
-    "setup": {
-        "fib_entry_start": 0.5,
-        "fib_entry_end": 0.618,
-        "fib_sl": 0.27,
-        "fib_tp_1": 1.0,
-        "fib_tp_2": 1.618,
-        "fib_tp_3": 2.618
-    },
-    "strategy": {
-        "min_tech_score": 5,
-        "min_quant_score": 3,
-        "risk_reward_min": 3.0
-    },
-    "indicators": {
-        "min_rvol": 2.0
-    },
-    "patterns": {
-        "tolerance": 0.015,
-        "double_top": true,
-        "double_bottom": true,
-        "bull_flag": true,
-        "bear_flag": true,
-        "ascending_triangle": true,
-        "descending_triangle": true, 
-        "bullish_rectangle": true
-    },
-    "pattern_signals": {
-        "double_bottom": "Long",
-        "double_top": "Short",
-        "bull_flag": "Long",
-        "bear_flag": "Short",
-        "ascending_triangle": "Long",
-        "descending_triangle": "Short", 
-        "bullish_rectangle": "Long"
+    "basis": {
+      "contango_threshold_pct": 0.05,
+      "backwardation_threshold_pct": -0.05,
+      "funding_crowded_threshold": 0.0005
     }
+  },
+  "risk": {
+    "default_leverage": 5,
+    "max_position_pct": 2.0,
+    "max_open_positions": 5,
+    "max_daily_loss_pct": 5.0,
+    "max_drawdown_pct": 10.0
+  },
+  "execution": {
+    "trailing_activation_pct": 1.0,
+    "trailing_distance_pct": 0.5,
+    "emergency_sl_pct": 2.5,
+    "max_hold_hours": 72
+  },
+  "auto_tune": {
+    "run_hour": 7,
+    "auto_tune_min_samples": 30,
+    "proven_edge_samples": 100
+  }
 }
