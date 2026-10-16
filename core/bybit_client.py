@@ -286,7 +286,7 @@ class BybitV5Client:
 
         # Neither — unknown schema
         return False, f"unrecognised auth response: {resp}"
-        
+
     async def get_all_tickers(
         self, category: str = "linear"
     ) -> List[Dict]:
@@ -527,7 +527,7 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        auth_resp = await _await_op_response(self._ws_trade, "auth")
+        auth_resp = await self._await_op_response(self._ws_trade, "auth")
         ok, err = _is_auth_ok(auth_resp)
         if not ok:
             raise ConnectionError(f"WS Trade auth failed: {err} | raw={auth_resp}")
