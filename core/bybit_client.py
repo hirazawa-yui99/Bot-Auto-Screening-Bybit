@@ -250,6 +250,43 @@ class BybitV5Client:
         )
         return symbols
 
+    async def _await_op_response(ws, expected_op: str, timeout: float = 10.0) -> dict:
+        """
+        Read WebSocket messages until we see the response with the expected `op`.
+        Skips pongs, subscription confirmations, and unrelated messages.
+
+        Bybit V5 endpoints use two different auth response schemas:
+          - /v5/trade   → {"retCode": 0, "retMsg": "OK", "op": "auth", ...}
+          - /v5/private → {"success": true, "ret_msg": "", "op": "auth", ...}
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.5, deadline - time.time())
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            msg = json.loads(raw)
+            if msg.get("op") == expected_op:
+                return msg
+        raise TimeoutError(f"No '{expected_op}' response within {timeout}s")
+
+
+    def _is_auth_ok(resp: dict) -> tuple[bool, str]:
+        """
+        Check auth response from either WS endpoint.
+        Returns (ok, error_message).
+        """
+        # Trade WS style
+        if "retCode" in resp:
+            ok = resp.get("retCode") == 0
+            return ok, resp.get("retMsg", "") if not ok else ""
+
+        # Private WS style
+        if "success" in resp:
+            ok = bool(resp.get("success"))
+            return ok, resp.get("ret_msg", "") if not ok else ""
+
+        # Neither — unknown schema
+        return False, f"unrecognised auth response: {resp}"
+        
     async def get_all_tickers(
         self, category: str = "linear"
     ) -> List[Dict]:
@@ -473,10 +510,12 @@ class BybitV5Client:
     #  WebSocket connections
     # ================================================================== #
     async def _connect_ws_trade(self):
+        """Authenticate and connect to V5 Trade WS."""
         self._ws_trade = await websockets.connect(
             self.WS_TRADE, ping_interval=20, ping_timeout=10,
         )
-        expires = int((time.time() + 60) * 1000)   # 60s buffer, not 10s
+
+        expires = int((time.time() + 60) * 1000)   # 60s buffer
         signature = hmac.new(
             self.cfg.api_secret.encode(),
             f"GET/realtime{expires}".encode(),
@@ -488,24 +527,19 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        # Bybit V5 returns retCode/retMsg, not a `success` field.
-        # The first message after auth send is the auth response.
-        raw = await asyncio.wait_for(self._ws_trade.recv(), timeout=10)
-        auth_resp = json.loads(raw)
-
-        if auth_resp.get("retCode") != 0:
-            raise ConnectionError(
-                f"WS Trade auth failed: "
-                f"retCode={auth_resp.get('retCode')} "
-                f"retMsg={auth_resp.get('retMsg')}"
-            )
+        auth_resp = await _await_op_response(self._ws_trade, "auth")
+        ok, err = _is_auth_ok(auth_resp)
+        if not ok:
+            raise ConnectionError(f"WS Trade auth failed: {err} | raw={auth_resp}")
         logger.info("WS Trade authenticated successfully")
 
     async def _connect_ws_private(self):
+        """Authenticate and connect to V5 Private WS."""
         self._ws_private = await websockets.connect(
-            self.WS_PRIVATE, ping_interval=20,
+            self.WS_PRIVATE, ping_interval=20, ping_timeout=10,
         )
-        expires = int((time.time() + 60) * 1000)
+
+        expires = int((time.time() + 60) * 1000)   # 60s buffer
         signature = hmac.new(
             self.cfg.api_secret.encode(),
             f"GET/realtime{expires}".encode(),
@@ -517,15 +551,11 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        raw = await asyncio.wait_for(self._ws_private.recv(), timeout=10)
-        auth_resp = json.loads(raw)
-
-        if auth_resp.get("retCode") != 0:
-            raise ConnectionError(
-                f"WS Private auth failed: "
-                f"retCode={auth_resp.get('retCode')} "
-                f"retMsg={auth_resp.get('retMsg')}"
-            )
+        # NOTE: Private WS uses `success` / `ret_msg`, NOT `retCode` / `retMsg`.
+        auth_resp = await _await_op_response(self._ws_private, "auth")
+        ok, err = _is_auth_ok(auth_resp)
+        if not ok:
+            raise ConnectionError(f"WS Private auth failed: {err} | raw={auth_resp}")
         logger.info("WS Private authenticated successfully")
 
     async def subscribe_private(
