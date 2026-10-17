@@ -1,11 +1,15 @@
 """
 execution/risk_manager.py
-Position sizing, drawdown control, kill switch.
+Position sizing, drawdown control, kill switch, funding-aware
+directional block.
+
+All methods are SYNCHRONOUS. Balance and position fetches are done
+by the caller (trade_executor) before invoking approve_trade.
 """
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -34,31 +38,29 @@ class RiskManager:
 
     def approve_trade(self, signal) -> Tuple[bool, float, str]:
         """
-        Returns: (approved, size_usd, reason)
+        Synchronous approval. Returns (approved, size_usd, reason).
         """
         self._maybe_reset_daily()
 
         if self.kill_switch:
             return False, 0.0, "kill_switch_active"
 
-        # Daily loss check
         if self.state.daily_pnl_pct <= -self.cfg.get("max_daily_loss_pct", 5.0):
             self.kill_switch = True
             return False, 0.0, "daily_loss_limit_hit"
 
-        # Max drawdown check
         if self.state.peak_equity > 0:
-            dd = (self.state.peak_equity - self.state.current_equity) / self.state.peak_equity * 100
+            dd = (
+                (self.state.peak_equity - self.state.current_equity)
+                / self.state.peak_equity * 100
+            )
             if dd >= self.cfg.get("max_drawdown_pct", 10.0):
                 self.kill_switch = True
                 return False, 0.0, "max_drawdown_hit"
 
-        # Max open positions
         if self.state.open_positions >= self.cfg.get("max_open_positions", 5):
             return False, 0.0, "max_open_positions"
 
-        # Risk-reward gate
-        # Risk-reward gate: require TP1 >= 1R and weighted avg >= 1.5R
         # ---- Funding-aware directional block ----
         meta = getattr(signal, "metadata", {}) or {}
         if signal.direction == "long" and meta.get("funding_block_long"):
@@ -67,46 +69,28 @@ class RiskManager:
         if signal.direction == "short" and meta.get("funding_block_short"):
             rate = meta.get("funding_rate_pct", 0.0)
             return False, 0.0, f"funding_short_crowded:{rate:+.3f}%"
-            
+
+        # ---- Risk-reward gates ----
         if hasattr(signal, "risk_reward_tp1"):
             tp1_rr = round(signal.risk_reward_tp1, 2)
-            if tp1_rr < 1.0:
+            if tp1_rr < 0.99:
                 return False, 0.0, f"tp1_rr_too_low:{tp1_rr:.2f}"
         if hasattr(signal, "risk_reward") and signal.risk_reward < 1.5:
             return False, 0.0, f"weighted_rr_too_low:{signal.risk_reward:.2f}"
 
-        # Position sizing: fixed fractional of equity
-        equity = self.state.current_equity or 10_000  # default 10k for paper mode
+        # ---- Position sizing ----
+        equity = self.state.current_equity or 100.0
         max_pct = self.cfg.get("max_position_pct", 2.0) / 100.0
         size_usd = equity * max_pct
 
-        # Scale by confidence (higher confidence → larger position, cap at max_pct)
         conf = getattr(signal, "confidence", 0.5)
         size_usd *= min(1.5, max(0.5, conf / 0.7))
 
-        # Apply leverage cap
         leverage = getattr(signal, "leverage", 5)
         notional_cap = equity * leverage * max_pct
         size_usd = min(size_usd, notional_cap)
-        try:
-            wallet = await self.client.get_wallet_balance()
-            usdt = next(
-                (c for c in wallet.get("list", [{}])[0].get("coin", [])
-                 if c.get("coin") == "USDT"), {}
-            )
-            available = float(usdt.get("availableToWithdraw", 0) or 0)
-        except Exception:
-            available = 0.0
-        
-        if available <= 0:
-            return False, 0.0, "no_available_balance"
-        
-        # Required initial margin = notional / leverage
-        required_margin = (signal.position_size_usd) / signal.leverage
-        if required_margin > available * 0.9:   # 10% safety buffer
-            return False, 0.0, f"insufficient_margin:{required_margin:.2f}>{available:.2f}"
-        
-        return True, signal.position_size_usd, "approved"
+
+        return True, size_usd, "approved"
 
     def update_equity(self, equity: float):
         self.state.current_equity = equity
