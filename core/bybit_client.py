@@ -80,7 +80,7 @@ class BybitV5Client:
     """
 
     REST_BASE = "https://api.bybit.com"
-    REST_TESTNET = "https://api-testnet.bybit.com"
+    REST_TESTNET = "https://api.bybit.com"
     WS_PUBLIC = "wss://stream.bybit.com/v5/public/{category}"
     WS_PRIVATE = "wss://stream.bybit.com/v5/private"
     WS_TRADE = "wss://stream.bybit.com/v5/trade"
