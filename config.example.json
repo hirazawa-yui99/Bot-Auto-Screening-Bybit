@@ -1,82 +1,119 @@
 {
   "api": {
-    "bybit_key": "YOUR_V5_API_KEY",
-    "bybit_secret": "YOUR_V5_API_SECRET",
+    "bybit_key": "YOUR_V5_API_KEY_HERE",
+    "bybit_secret": "YOUR_V5_API_SECRET_HERE",
     "testnet": false,
-    "discord_webhook": "https://discord.com/api/webhooks/...",
-    "discord_live_webhook": "https://discord.com/api/webhooks/...",
-    "discord_dashboard_webhook": "https://discord.com/api/webhooks/..."
+    "discord_webhook": "https://discord.com/api/webhooks/XXX/YYY",
+    "discord_live_webhook": "https://discord.com/api/webhooks/XXX/YYY",
+    "discord_dashboard_webhook": "https://discord.com/api/webhooks/XXX/YYY"
   },
+
   "deepseek": {
-    "api_key": "sk-...",
+    "api_key": "sk-YOUR_DEEPSEEK_KEY_HERE",
     "base_url": "https://api.deepseek.com/v1",
     "model": "deepseek-flash",
+    "model_high_confidence": "deepseek-v4-pro",
     "temperature": 0.3,
-    "max_tokens": 1500
+    "max_tokens": 1500,
+    "timeout": 30,
+    "error_cooldown_sec": 900
   },
+
   "database": {
-    "host": "localhost",
+    "host": "127.0.0.1",
     "database": "bybit_bot_v9",
     "user": "postgres",
     "password": "",
     "port": "5432"
   },
+
   "system": {
     "timezone": "UTC",
     "check_interval_hours": 1,
     "max_threads": 10,
-    "max_concurrent": 10,
+    "max_concurrent": 3,
     "scan_top_n": 0,
-    "min_turnover_24h": 5000000
+    "min_turnover_24h": 1000000
   },
+
   "strategy": {
-    "min_raw_threshold": 65.0,
-    "min_calibrated": 0.72,
-    "risk_reward_min": 2.5,
+    "min_raw_threshold": 42.0,
+    "min_calibrated": 0.42,
+    "risk_reward_min": 1.5,
+
     "composite_weights": {
-      "mean_reversion": 0.25,
-      "basis": 0.15,
+      "mean_reversion": 0.20,
+      "basis": 0.10,
       "volume": 0.15,
-      "derivatives": 0.30,
+      "derivatives": 0.25,
+      "funding": 0.15,
       "momentum": 0.15
     },
+
     "mean_reversion": {
       "min_samples": 60,
       "hurst_stationary_threshold": 0.45,
       "zeta_entry_threshold": 1.5,
       "adf_pvalue_max": 0.10
     },
+
     "volume_anomaly": {
       "baseline_window": 50,
       "z_high_threshold": 2.0,
       "z_extreme_threshold": 3.0
     },
+
     "basis": {
       "contango_threshold_pct": 0.05,
       "backwardation_threshold_pct": -0.05,
       "funding_crowded_threshold": 0.0005
     }
   },
+
+  "funding": {
+    "neutral_band_pct": 0.01,
+    "elevated_pct": 0.02,
+    "high_pct": 0.05,
+    "extreme_pct": 0.10,
+    "block_long_at_pct": 0.05,
+    "block_short_at_pct": -0.05,
+    "annualization_factor": 3
+  },
+
   "risk": {
     "default_leverage": 5,
-    "max_position_pct": 2.0,
-    "max_open_positions": 5,
+    "max_position_pct": 10.0,
+    "max_open_positions": 3,
     "max_daily_loss_pct": 5.0,
     "max_drawdown_pct": 10.0
   },
+
   "execution": {
-    "trailing_activation_pct": 1.0,
-    "trailing_distance_pct": 0.5,
-    "emergency_sl_pct": 2.5,
-    "max_hold_hours": 72,
+    "entry_order_type": "limit_preferred",
+    "market_tolerance_pct": 0.15,
+    "max_deviation_pct": 3.0,
+    "cancel_on_rally_pct": 1.5,
+    "limit_order_expiry_minutes": 30,
+    "limit_check_interval_sec": 20,
 
     "tp_mode": "r_multiple",
     "atr_multiplier_sl": 1.5,
     "tp_r_multiples": [1.0, 2.0, 3.0],
     "tp_weights": [0.40, 0.35, 0.25],
+    "tp_attach_mode": "limits_only",
+    "tp_placement_retries": 2,
+    "tp_placement_retry_delay_sec": 1.5,
+    "tp_min_position_warn_usd": 30.0,
+
+    "trailing_activation_pct": 1.0,
+    "trailing_distance_pct": 0.5,
     "move_sl_to_be_after_tp1": true,
-    "move_sl_to_tp1_after_tp2": true
-},
+    "move_sl_to_tp1_after_tp2": true,
+
+    "emergency_sl_pct": 2.5,
+    "max_hold_hours": 72
+  },
+
   "auto_tune": {
     "run_hour": 7,
     "auto_tune_min_samples": 30,
