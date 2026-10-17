@@ -68,8 +68,15 @@
     "trailing_activation_pct": 1.0,
     "trailing_distance_pct": 0.5,
     "emergency_sl_pct": 2.5,
-    "max_hold_hours": 72
-  },
+    "max_hold_hours": 72,
+
+    "tp_mode": "r_multiple",
+    "atr_multiplier_sl": 1.5,
+    "tp_r_multiples": [1.0, 2.0, 3.0],
+    "tp_weights": [0.40, 0.35, 0.25],
+    "move_sl_to_be_after_tp1": true,
+    "move_sl_to_tp1_after_tp2": true
+},
   "auto_tune": {
     "run_hour": 7,
     "auto_tune_min_samples": 30,

@@ -350,7 +350,7 @@ class BybitV5Client:
         if turnover_map:
             top_sorted = sorted(
                 turnover_map.items(), key=lambda x: x[1], reverse=True
-            )[:10]
+            )
             logger.info("Top 10 symbols by turnover24h:")
             for sym, val in top_sorted:
                 logger.info(f"  {sym:20s}  {val:>20,.0f}")
@@ -590,6 +590,25 @@ class BybitV5Client:
         response = await asyncio.wait_for(
             self._ws_trade.recv(), timeout=10,
         )
+        return json.loads(response)
+
+    async def cancel_order_ws(self, symbol: str, order_id: str) -> Dict:
+        """Cancel an order via WS Trade API."""
+        if not _ws_is_open(self._ws_trade):
+            await self._connect_ws_trade()
+
+        req_id = f"cancel_{int(time.time() * 1000)}"
+        payload = {
+            "op": "order.cancel",
+            "args": [{
+                "category": self.cfg.category,
+                "symbol": symbol,
+                "orderId": order_id,
+            }],
+            "reqId": req_id,
+        }
+        await self._ws_trade.send(json.dumps(payload))
+        response = await asyncio.wait_for(self._ws_trade.recv(), timeout=10)
         return json.loads(response)
 
     async def set_trading_stop(

@@ -123,6 +123,48 @@ class QuantBotV9:
         await self.db.close()
         logger.info("Shutdown complete.")
 
+    def _compute_tp_levels(
+        self, entry: float, atr: float, direction: str,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Compute SL and TP1/TP2/TP3 levels.
+
+        Returns: (sl, tp1, tp2, tp3)
+
+        Modes:
+          - "r_multiple" (default): SL = entry - atr_mult * ATR (defines 1R)
+                                    TP1 = entry + 1R, TP2 = entry + 2R, TP3 = entry + 3R
+          - "atr":  SL = entry - sl_mult*ATR
+                    TP1/TP2/TP3 = entry ± tp_mults[i]*ATR
+        """
+        cfg = self.config["execution"]
+        mode = cfg.get("tp_mode", "r_multiple")
+        sl_mult = cfg.get("atr_multiplier_sl", 1.5)
+        r_mults = cfg.get("tp_r_multiples", [1.0, 2.0, 3.0])
+
+        # Guard against zero/negative ATR
+        if atr <= 0 or not math.isfinite(atr):
+            atr = entry * 0.01  # fallback to 1%
+
+        if direction == "long":
+            sl = entry - sl_mult * atr
+            risk = entry - sl
+            if mode == "atr":
+                tp_mults = cfg.get("tp_atr_multiples", [1.5, 2.5, 4.0])
+                tps = [entry + m * atr for m in tp_mults]
+            else:  # r_multiple
+                tps = [entry + risk * r for r in r_mults]
+        else:
+            sl = entry + sl_mult * atr
+            risk = sl - entry
+            if mode == "atr":
+                tp_mults = cfg.get("tp_atr_multiples", [1.5, 2.5, 4.0])
+                tps = [entry - m * atr for m in tp_mults]
+            else:
+                tps = [entry - risk * r for r in r_mults]
+
+        return sl, tps[0], tps[1], tps[2]
+
     # ================================================================== #
     #  FULL-PAIR SCAN LOOP
     # ================================================================== #
@@ -344,22 +386,31 @@ class QuantBotV9:
             sl = entry + 1.5 * atr
             tp1 = entry - 3.0 * atr
 
+        sl, tp1, tp2, tp3 = self._compute_tp_levels(
+            entry=entry,
+            atr=atr,
+            direction=bias,
+        )
+
         signal = TradeSignal(
             symbol=symbol,
             direction=bias,
             entry_price=entry,
             stop_loss=round(sl, 6),
             take_profit_1=round(tp1, 6),
+            take_profit_2=round(tp2, 6),
+            take_profit_3=round(tp3, 6),
+            tp_weights=tuple(self.config["execution"].get(
+                "tp_weights", [0.40, 0.35, 0.25]
+            )),
             confidence=final.calibrated_confidence,
             leverage=self.config["risk"].get("default_leverage", 5),
-            reason=f"Raw={final.raw_total:.0f} "
-                   f"Composite={composite.total_score:.2f} "
-                   f"Conviction={composite.conviction}",
-            metadata={
-                "signal_id": signal_id,
-                "llm": llm_response,
-                "composite": composite.total_score,
-            },
+            reason=(
+                f"Raw={final.raw_total:.0f} "
+                f"Composite={composite.total_score:.2f} "
+                f"Conviction={composite.conviction}"
+            ),
+            metadata={"signal_id": signal_id, "llm": llm_response},
         )
 
         result = await self.executor.execute_signal(signal)

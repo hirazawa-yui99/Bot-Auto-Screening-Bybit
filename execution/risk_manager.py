@@ -58,8 +58,11 @@ class RiskManager:
             return False, 0.0, "max_open_positions"
 
         # Risk-reward gate
+        # Risk-reward gate: require TP1 >= 1R and weighted avg >= 1.5R
+        if hasattr(signal, "risk_reward_tp1") and signal.risk_reward_tp1 < 1.0:
+            return False, 0.0, f"tp1_rr_too_low:{signal.risk_reward_tp1:.2f}"
         if hasattr(signal, "risk_reward") and signal.risk_reward < 1.5:
-            return False, 0.0, f"rr_too_low:{signal.risk_reward:.2f}"
+            return False, 0.0, f"weighted_rr_too_low:{signal.risk_reward:.2f}"
 
         # Position sizing: fixed fractional of equity
         equity = self.state.current_equity or 10_000  # default 10k for paper mode
