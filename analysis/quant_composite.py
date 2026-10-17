@@ -5,6 +5,9 @@ Composite quantitative scoring engine.
 Combines: mean reversion, basis spread, volume anomaly,
 derivatives (CVD/OI/L-S), funding rate, and momentum into a
 single normalized score in [−1, +1].
+
+Weights are merged over DEFAULT_WEIGHTS in __init__, so any new
+component you add later cannot trigger a KeyError on old configs.
 """
 import logging
 from dataclasses import dataclass, field
@@ -55,21 +58,48 @@ class CompositeQuantEngine:
     }
 
     def __init__(
-        self, client, weights: Optional[Dict[str, float]] = None,
+        self,
+        client,
+        weights: Optional[Dict[str, float]] = None,
         funding_config: Optional[Dict] = None,
     ):
         self.client = client
-        self.weights = weights or self.DEFAULT_WEIGHTS.copy()
+
+        # Merge user-provided weights over defaults so any missing
+        # key (e.g. "funding" on old configs) is backfilled silently.
+        merged = self.DEFAULT_WEIGHTS.copy()
+        if weights:
+            for k, v in weights.items():
+                if k in merged:
+                    try:
+                        merged[k] = float(v)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"Ignoring invalid weight '{k}'='{v}'"
+                        )
+                else:
+                    logger.warning(
+                        f"Ignoring unknown weight key '{k}' (not in "
+                        f"DEFAULT_WEIGHTS)"
+                    )
+
+        # Renormalize
+        s = sum(merged.values())
+        if s <= 0:
+            logger.error("All composite weights are zero — using defaults")
+            merged = self.DEFAULT_WEIGHTS.copy()
+            s = sum(merged.values())
+        if abs(s - 1.0) > 1e-6:
+            logger.info(f"Composite weights sum to {s:.4f}, renormalizing")
+            for k in merged:
+                merged[k] /= s
+
+        self.weights = merged
+
         self.mr_analyzer = MeanReversionAnalyzer()
         self.basis_analyzer = BasisAnalyzer(client)
         self.vol_analyzer = VolumeAnomalyAnalyzer()
         self.funding_analyzer = FundingAnalyzer(funding_config)
-
-        s = sum(self.weights.values())
-        if abs(s - 1.0) > 1e-6:
-            logger.warning(f"Weights sum to {s}, renormalizing")
-            for k in self.weights:
-                self.weights[k] /= s
 
     def _momentum_contribution(self, indicators: Dict) -> float:
         score = 0.0
@@ -104,23 +134,34 @@ class CompositeQuantEngine:
         closes = df["close"].astype(float)
 
         # 1. Mean reversion
-        out.mean_reversion = self.mr_analyzer.analyze(
-            closes, bar_interval_hours=bar_interval_hours,
-        )
+        try:
+            out.mean_reversion = self.mr_analyzer.analyze(
+                closes, bar_interval_hours=bar_interval_hours,
+            )
+        except Exception as e:
+            logger.debug(f"{symbol}: mean reversion failed: {e}")
 
-        # 2. Basis spread
+        # 2. Basis
         try:
             out.basis = await self.basis_analyzer.compute(symbol)
         except Exception as e:
-            logger.debug(f"Basis compute failed for {symbol}: {e}")
+            logger.debug(f"{symbol}: basis compute failed: {e}")
 
         # 3. Volume anomaly
-        out.volume = self.vol_analyzer.analyze(df)
+        try:
+            out.volume = self.vol_analyzer.analyze(df)
+        except Exception as e:
+            logger.debug(f"{symbol}: volume anomaly failed: {e}")
 
-        # 4. Funding rate (NEW)
-        out.funding = await self.funding_analyzer.analyze(symbol, self.client)
+        # 4. Funding
+        try:
+            out.funding = await self.funding_analyzer.analyze(
+                symbol, self.client,
+            )
+        except Exception as e:
+            logger.debug(f"{symbol}: funding compute failed: {e}")
 
-        # 5. Derivatives (CVD/OI/L-S)
+        # 5. Derivatives
         out.derivative_score = getattr(
             derivative_snapshot, "confidence_contribution", 0.0,
         )
@@ -128,13 +169,31 @@ class CompositeQuantEngine:
         # 6. Momentum
         momentum_contrib = self._momentum_contribution(indicators)
 
-        # Normalize each to [-1, +1]
-        mr_norm = out.mean_reversion.confidence_contribution / self.NORMALIZERS["mean_reversion"]
-        basis_norm = out.basis.confidence_contribution / self.NORMALIZERS["basis"]
-        vol_norm = out.volume.confidence_contribution / self.NORMALIZERS["volume"]
-        deriv_norm = out.derivative_score / self.NORMALIZERS["derivatives"]
-        funding_norm = out.funding.confidence_contribution / self.NORMALIZERS["funding"]
-        mom_norm = momentum_contrib / self.NORMALIZERS["momentum"]
+        # Normalize to [-1, +1]
+        mr_norm = (
+            out.mean_reversion.confidence_contribution
+            / self.NORMALIZERS["mean_reversion"]
+        )
+        basis_norm = (
+            out.basis.confidence_contribution
+            / self.NORMALIZERS["basis"]
+        )
+        vol_norm = (
+            out.volume.confidence_contribution
+            / self.NORMALIZERS["volume"]
+        )
+        deriv_norm = (
+            out.derivative_score
+            / self.NORMALIZERS["derivatives"]
+        )
+        funding_norm = (
+            out.funding.confidence_contribution
+            / self.NORMALIZERS["funding"]
+        )
+        mom_norm = (
+            momentum_contrib
+            / self.NORMALIZERS["momentum"]
+        )
 
         out.total_score = float(np.clip(
             self.weights["mean_reversion"] * mr_norm
@@ -158,9 +217,12 @@ class CompositeQuantEngine:
             out.conviction = "medium"
 
         component_signs = [
-            np.sign(mr_norm), np.sign(basis_norm),
-            np.sign(vol_norm), np.sign(deriv_norm),
-            np.sign(funding_norm), np.sign(mom_norm),
+            np.sign(mr_norm),
+            np.sign(basis_norm),
+            np.sign(vol_norm),
+            np.sign(deriv_norm),
+            np.sign(funding_norm),
+            np.sign(mom_norm),
         ]
         nonzero = [s for s in component_signs if s != 0]
         if nonzero:

@@ -277,7 +277,7 @@ class QuantBotV9:
             bias=bias,
             llm_response=None,
             composite=composite,
-            funding_result=composite.funding,   # NEW
+            funding_result=getattr(composite, "funding", None),
         )
         if prelim.raw_total < 40:
             await self.journal.log_signal({
@@ -301,10 +301,10 @@ class QuantBotV9:
                 "funding_annualized_pct": composite.basis.funding_annualized,
                 "volume_zscore": composite.volume.z_score,
                 "volume_anomaly_level": composite.volume.anomaly_level,
-                "funding_rate_pct": composite.funding.rate_pct,
-                "funding_annualized_pct": composite.funding.annualized_pct,
-                "funding_regime": composite.funding.regime,
-                "funding_contrarian_bias": composite.funding.contrarian_bias,
+                "funding_rate_pct": getattr(_f, "rate_pct", 0.0) if _f else 0.0,
+                "funding_annualized_pct": getattr(_f, "annualized_pct", 0.0) if _f else 0.0,
+                "funding_regime": getattr(_f, "regime", "neutral") if _f else "neutral",
+                "funding_contrarian_bias": getattr(_f, "contrarian_bias", "neutral") if _f else "neutral",
                 "_breakdown": {
                     "technical_score": prelim.technical_score,
                     "composite_score": prelim.composite_score,
@@ -455,16 +455,16 @@ class QuantBotV9:
             reason=(
                 f"Raw={final.raw_total:.0f} "
                 f"Composite={composite.total_score:.2f} "
-                f"Conviction={composite.conviction}"
+                f"Funding={(getattr(_f, 'rate_pct', 0.0) if _f else 0.0):+.3f}%"
             ),
             metadata={
                 "signal_id": signal_id,
                 "llm": llm_response,
                 # --- NEW: funding flags for risk manager ---
-                "funding_rate_pct": composite.funding.rate_pct,
-                "funding_block_long": composite.funding.should_block_long,
-                "funding_block_short": composite.funding.should_block_short,
-                "funding_regime": composite.funding.regime,
+                "funding_rate_pct": getattr(_f, "rate_pct", 0.0) if _f else 0.0,
+                "funding_block_long": getattr(_f, "should_block_long", False) if _f else False,
+                "funding_block_short": getattr(_f, "should_block_short", False) if _f else False,
+                "funding_regime": getattr(_f, "regime", "neutral") if _f else "neutral",
             },
         )
 
