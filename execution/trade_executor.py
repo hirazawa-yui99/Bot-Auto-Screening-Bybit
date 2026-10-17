@@ -285,7 +285,7 @@ class TradeExecutor:
                 side=signal.side,
                 qty=rounded_qty,
                 order_type="Market",
-                take_profit=signal.take_profit_1,
+                take_profit=None,
                 stop_loss=signal.stop_loss,
                 tp_trigger_by="LastPrice",
                 sl_trigger_by="LastPrice",
@@ -415,7 +415,7 @@ class TradeExecutor:
                 qty=rounded_qty,
                 order_type="Limit",
                 price=limit_price,
-                take_profit=tp1,
+                take_profit=None,
                 stop_loss=sl,
                 tp_trigger_by="LastPrice",
                 sl_trigger_by="LastPrice",
@@ -690,7 +690,7 @@ class TradeExecutor:
             remaining_qty=filled_qty,
             stop_loss=sl,
             initial_stop_loss=sl,
-            tps=[tp1] + list(signal.tp_list[1:]),
+            tps=signal.tp_list,
             tp_weights=list(signal.tp_weights[:len(signal.tp_list)]),
             tp_order_ids=tp_order_ids,
             tp_filled={tp: False for tp in signal.tp_list},
@@ -720,8 +720,6 @@ class TradeExecutor:
         tp_order_ids: Dict[float, str] = {}
 
         for i, tp_price in enumerate(tps):
-            if i == 0:
-                continue  # TP1 is native on the entry order
             w = weights[i] if i < len(weights) else 0.0
             tp_qty = filled_qty * w
             if tp_qty <= 0:
