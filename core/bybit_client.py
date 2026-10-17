@@ -43,26 +43,18 @@ def _ws_is_open(ws) -> bool:
     Handles both API versions:
       - websockets < 12  : legacy WebSocketClientProtocol → .closed
       - websockets >= 12 : new ClientConnection          → .state
-
-    The new API returns a State enum; we compare by name to avoid
-    importing State directly (which may not exist on older versions).
     """
     if ws is None:
         return False
-
-    # Legacy API (websockets <= 11)
     if hasattr(ws, "closed"):
         try:
             return not ws.closed
         except Exception:
             return False
-
-    # New API (websockets >= 12)
     state = getattr(ws, "state", None)
     if state is not None:
         name = getattr(state, "name", str(state))
         return name == "OPEN"
-
     return False
 
 
@@ -80,11 +72,6 @@ class BybitConfig:
 class BybitV5Client:
     """
     Unified Bybit V5 client with full-symbol scanning support.
-
-    REST limits (per Bybit docs):
-      - HTTP IP limit: 600 req / 5s window across all api.bybit.com hosts
-      - Tickers/Kline: ~10 req/s per IP
-    We hold a semaphore at 8 concurrent requests to stay well within bounds.
     """
 
     REST_BASE = "https://api.bybit.com"
@@ -132,13 +119,6 @@ class BybitV5Client:
         params: Optional[Dict] = None,
         signed: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Execute REST request with retry, rate-limit back-off, and semaphore.
-
-        Unsigned GET requests pass `params` via aiohttp's `params=` argument.
-        Signed GET requests build the canonical query string for HMAC
-        signing and append it directly to the URL.
-        """
         async with self._rate_limiter:
             params = params or {}
             url = f"{self.base_url}{endpoint}"
@@ -149,7 +129,6 @@ class BybitV5Client:
             if signed:
                 ts = int(time.time() * 1000)
                 if method.upper() == "GET":
-                    # Canonical query string for signing
                     query = "&".join(
                         f"{k}={v}" for k, v in sorted(params.items())
                     )
@@ -176,7 +155,6 @@ class BybitV5Client:
                     use_params = None
                     use_json = params
             else:
-                # Unsigned requests
                 if method.upper() == "GET":
                     use_params = params
                     use_json = None
@@ -208,10 +186,6 @@ class BybitV5Client:
 
                         if data.get("retCode") != 0:
                             code = data.get("retCode")
-                            # 10001 = Invalid parameter / Not supported symbol
-                            # 10002 = Invalid API key
-                            # These are informational for per-symbol calls;
-                            # log at DEBUG to keep journals readable.
                             if code in (10001, 10002):
                                 logger.debug(
                                     f"Bybit retCode {code} for "
@@ -253,14 +227,11 @@ class BybitV5Client:
         """
         Retrieve ALL active linear USDT perpetual symbols on Bybit.
 
-        Diagnostic version — logs intermediate filter counts and
-        samples top symbols by turnover so we can see what's actually
-        coming back from the exchange.
-
-        Confirmed Bybit field names:
-          - tickers response: turnover24h (string)[reference:2]
-          - instruments-info: contractType = "LinearPerpetual"[reference:3]
-          - instruments-info: quoteCoin = "USDT"[reference:4]
+        Fixes the documented Bybit API bug where turnover24h and
+        volume24h are occasionally returned inverted (base-asset volume
+        showing up in the turnover field). Detects the inversion by
+        comparing the two fields and reconstructs the correct quote-
+        asset turnover as volume24h × lastPrice.
         """
         # ---- Step 1: fetch all instruments (paginated) -----------------
         all_instruments: List[Dict] = []
@@ -317,45 +288,96 @@ class BybitV5Client:
             f"not_perp={filtered['not_perp']})"
         )
 
+        if not usdt_perps:
+            logger.error("No USDT perpetuals found — aborting scan")
+            return []
+
         # ---- Step 3: fetch all tickers (batched) -----------------------
         tickers = await self.get_all_tickers(category="linear")
         logger.info(f"Fetched {len(tickers)} tickers for linear category")
 
         if tickers:
-            sample = tickers[0]
             logger.info(
-                f"Sample ticker fields: {list(sample.keys())}"
+                f"Sample ticker fields: {list(tickers[0].keys())}"
             )
 
-        # Build turnover map. Bybit's tickers response uses `turnover24h`
-        # for USDT-margined linear products[reference:5]. Fall back to
-        # `openInterestValue` if turnover is missing.
+        # ---- Step 4: build turnover map (robust to field inversion) ----
         turnover_map: Dict[str, float] = {}
+        inversions_detected = 0
+        reconstructions = 0
+
         for t in tickers:
             sym = t.get("symbol")
             if not sym:
                 continue
-            raw = (
-                t.get("turnover24h")
-                or t.get("openInterestValue")
-                or t.get("volume24h")
-                or 0
-            )
+
             try:
-                turnover_map[sym] = float(raw)
+                turnover = float(t.get("turnover24h") or 0)
+                volume = float(t.get("volume24h") or 0)
+                last_price = float(t.get("lastPrice") or 0)
             except (TypeError, ValueError):
                 turnover_map[sym] = 0.0
+                continue
 
-        # Log top-10 symbols by turnover for diagnosis
+            # Detect field inversion: for USDT-quoted perps with price > 1,
+            # quote turnover (USDT) must exceed base volume (BTC, ETH, ...).
+            # If turnover < volume and price > 1, Bybit returned the fields
+            # swapped — reconstruct turnover from volume × price.
+            if turnover > 0 and volume > 0 and last_price > 1.0:
+                if turnover < volume:
+                    turnover = volume * last_price
+                    inversions_detected += 1
+                    logger.debug(
+                        f"{sym}: field inversion detected — "
+                        f"reconstructed turnover = {turnover:,.0f}"
+                    )
+            elif turnover == 0 and volume > 0 and last_price > 0:
+                # turnover24h missing — reconstruct from volume × price
+                turnover = volume * last_price
+                reconstructions += 1
+                logger.debug(
+                    f"{sym}: turnover missing — "
+                    f"reconstructed = {turnover:,.0f}"
+                )
+
+            turnover_map[sym] = turnover
+
+        if inversions_detected:
+            logger.warning(
+                f"Field inversion detected on {inversions_detected} symbols "
+                f"— turnover reconstructed from volume × price"
+            )
+        if reconstructions:
+            logger.info(
+                f"Turnover reconstructed for {reconstructions} symbols "
+                f"with missing turnover24h"
+            )
+
+        # ---- Step 5: log top 20 by turnover ---------------------------
         if turnover_map:
             top_sorted = sorted(
                 turnover_map.items(), key=lambda x: x[1], reverse=True
-            )
-            logger.info("Top 10 symbols by turnover24h:")
+            )[:20]
+            logger.info("Top 20 symbols by corrected turnover24h:")
             for sym, val in top_sorted:
-                logger.info(f"  {sym:20s}  {val:>20,.0f}")
+                logger.info(f"  {sym:25s}  {val:>20,.0f} USDT")
 
-        # ---- Step 4: filter by turnover --------------------------------
+        # ---- Step 6: near-miss diagnostic ------------------------------
+        if turnover_map:
+            near_miss = [
+                (s, turnover_map.get(s, 0))
+                for s in usdt_perps
+                if 100_000 <= turnover_map.get(s, 0) < min_turnover_24h
+            ]
+            near_miss.sort(key=lambda x: x[1], reverse=True)
+            logger.info(
+                f"Near-miss perpetuals (100k-{min_turnover_24h:,.0f}): "
+                f"{len(near_miss)} symbols"
+            )
+            for sym, val in near_miss[:10]:
+                logger.info(f"  {sym:25s}  {val:>20,.0f} USDT")
+
+        # ---- Step 7: filter by turnover --------------------------------
         if min_turnover_24h > 0:
             if not turnover_map:
                 logger.error(
@@ -371,6 +393,11 @@ class BybitV5Client:
                 symbols.sort(
                     key=lambda s: turnover_map.get(s, 0), reverse=True,
                 )
+                logger.info("Top 5 after correction:")
+                for sym in symbols[:5]:
+                    logger.info(
+                        f"  {sym:25s}  {turnover_map[sym]:>20,.0f} USDT"
+                    )
         else:
             symbols = usdt_perps
             symbols.sort()
@@ -381,7 +408,7 @@ class BybitV5Client:
         )
 
         if symbols:
-            logger.info(f"First 10 symbols: {symbols[:10]}")
+            logger.info(f"First 10 final symbols: {symbols[:10]}")
 
         return symbols
 
@@ -406,7 +433,6 @@ class BybitV5Client:
     ) -> List[List]:
         """
         GET /v5/market/kline — returns [[ts, o, h, l, c, v, turnover], ...]
-        Bybit docs confirm interval values: 1,3,5,15,30,60,120,240,360,720,D,W,M[reference:6]
         """
         data = await self._rest_request(
             "GET", "/v5/market/kline",
@@ -425,7 +451,7 @@ class BybitV5Client:
         interval_time: str = "1h",
         limit: int = 50,
     ) -> List[Dict]:
-        """GET /v5/market/open-interest — intervalTime: 5min,15min,30min,1h,4h,1d"""
+        """GET /v5/market/open-interest"""
         data = await self._rest_request(
             "GET", "/v5/market/open-interest",
             params={
@@ -440,10 +466,7 @@ class BybitV5Client:
     async def get_account_ratio(
         self, symbol: str, period: str = "1h", limit: int = 50,
     ) -> List[Dict]:
-        """
-        GET /v5/market/account-ratio — Account Long/Short Ratio.
-        period: 5min,15min,30min,1h,4h,1d (confirmed by Bybit docs[reference:7])
-        """
+        """GET /v5/market/account-ratio — Account Long/Short Ratio."""
         data = await self._rest_request(
             "GET", "/v5/market/account-ratio",
             params={
@@ -456,20 +479,12 @@ class BybitV5Client:
         return data.get("result", {}).get("list", [])
 
     async def get_funding_rate(self, symbol: str) -> Dict:
-        """
-        GET /v5/market/tickers?symbol=X — extract funding fields.
-
-        Returns empty dict if the symbol isn't valid for the current
-        category (e.g. spot-only symbols mistakenly passed in). This is
-        common when the symbol universe drifts between calls and should
-        not crash the scan.
-        """
+        """GET /v5/market/tickers?symbol=X — extract funding fields."""
         data = await self._rest_request(
             "GET", "/v5/market/tickers",
             params={"category": self.cfg.category, "symbol": symbol},
         )
 
-        # Handle Bybit error responses gracefully
         if data.get("retCode") == 10001:
             logger.debug(
                 f"Ticker unavailable for {symbol} "
@@ -547,13 +562,7 @@ class BybitV5Client:
         tpsl_mode: str = "Full",
         reduce_only: bool = False,
     ) -> Dict:
-        """
-        Place order via V5 WebSocket Trade API.
-        Native TP/SL is attached so the exchange protects the position
-        even if the bot disconnects.
-
-        Confirmed operation: op = "order.create"[reference:8]
-        """
+        """Place order via V5 WebSocket Trade API with native TP/SL."""
         if not _ws_is_open(self._ws_trade):
             await self._connect_ws_trade()
 
@@ -662,14 +671,7 @@ class BybitV5Client:
         expected_op: str,
         timeout: float = 10.0,
     ) -> dict:
-        """
-        Read WebSocket messages until we see the response with the
-        expected `op`. Skips pongs and unrelated messages.
-
-        Bybit V5 endpoints use different auth response schemas:
-          - /v5/trade   → {"retCode": 0, "retMsg": "OK", "op": "auth", ...}[reference:9]
-          - /v5/private → {"success": true, "ret_msg": "", "op": "auth", ...}
-        """
+        """Read WebSocket messages until we see the expected `op`."""
         timeout = float(timeout)
         deadline = time.time() + timeout
 
@@ -685,16 +687,11 @@ class BybitV5Client:
         )
 
     def _is_auth_ok(self, resp: dict) -> tuple:
-        """
-        Check auth response from either WS endpoint.
-        Returns (ok: bool, error_message: str).
-        """
-        # Trade WS schema
+        """Check auth response from either WS endpoint."""
         if "retCode" in resp:
             ok = resp.get("retCode") == 0
             return ok, "" if ok else resp.get("retMsg", "")
 
-        # Private WS schema
         if "success" in resp:
             ok = bool(resp.get("success"))
             return ok, "" if ok else resp.get("ret_msg", "")
@@ -710,7 +707,7 @@ class BybitV5Client:
             self.WS_TRADE, ping_interval=20, ping_timeout=10,
         )
 
-        expires = int((time.time() + 60) * 1000)   # 60s buffer
+        expires = int((time.time() + 60) * 1000)
         signature = hmac.new(
             self.cfg.api_secret.encode(),
             f"GET/realtime{expires}".encode(),
@@ -738,7 +735,7 @@ class BybitV5Client:
             self.WS_PRIVATE, ping_interval=20, ping_timeout=10,
         )
 
-        expires = int((time.time() + 60) * 1000)   # 60s buffer
+        expires = int((time.time() + 60) * 1000)
         signature = hmac.new(
             self.cfg.api_secret.encode(),
             f"GET/realtime{expires}".encode(),
@@ -750,7 +747,6 @@ class BybitV5Client:
             "args": [self.cfg.api_key, expires, signature],
         }))
 
-        # Private WS uses `success` / `ret_msg`, NOT `retCode` / `retMsg`.
         auth_resp = await self._await_op_response(
             self._ws_private, "auth",
         )

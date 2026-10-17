@@ -182,7 +182,7 @@ class QuantBotV9:
         interval = self.config["system"].get("check_interval_hours", 1)
         scan_top_n = self.config["system"].get("scan_top_n", 0)
         min_turnover = self.config["system"].get(
-            "min_turnover_24h", 5_000_000,
+            "min_turnover_24h", 1_000_000,
         )
 
         while self._running:
