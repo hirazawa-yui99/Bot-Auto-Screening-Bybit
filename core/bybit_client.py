@@ -642,7 +642,14 @@ class BybitV5Client:
             await self._connect_ws_trade()
 
         req_id = f"order_{int(time.time() * 1000)}"
+        now_ms = str(int(time.time() * 1000))
+
         payload = {
+            "reqId": req_id,
+            "header": {
+                "X-BAPI-TIMESTAMP": now_ms,
+                "X-BAPI-RECV-WINDOW": str(self.cfg.recv_window),
+            },
             "op": "order.create",
             "args": [{
                 "category": self.cfg.category,
@@ -653,7 +660,6 @@ class BybitV5Client:
                 "timeInForce": "IOC" if order_type == "Market" else "GTC",
                 "reduceOnly": reduce_only,
             }],
-            "reqId": req_id,
         }
 
         if take_profit is not None:
@@ -683,13 +689,17 @@ class BybitV5Client:
 
         req_id = f"cancel_{int(time.time() * 1000)}"
         payload = {
+            "reqId": req_id,
+            "header": {
+                "X-BAPI-TIMESTAMP": str(int(time.time() * 1000)),
+                "X-BAPI-RECV-WINDOW": str(self.cfg.recv_window),
+            },
             "op": "order.cancel",
             "args": [{
                 "category": self.cfg.category,
                 "symbol": symbol,
                 "orderId": order_id,
             }],
-            "reqId": req_id,
         }
         await self._ws_trade.send(json.dumps(payload))
         response = await asyncio.wait_for(self._ws_trade.recv(), timeout=10)
