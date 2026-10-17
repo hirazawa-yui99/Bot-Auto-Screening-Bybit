@@ -72,6 +72,11 @@ class BybitConfig:
 class BybitV5Client:
     """
     Unified Bybit V5 client with full-symbol scanning support.
+
+    REST limits (per Bybit docs):
+      - HTTP IP limit: 600 req / 5s window across all api.bybit.com hosts
+      - Tickers/Kline: ~10 req/s per IP
+    We hold a semaphore at 8 concurrent requests to stay well within bounds.
     """
 
     REST_BASE = "https://api.bybit.com"
@@ -119,6 +124,9 @@ class BybitV5Client:
         params: Optional[Dict] = None,
         signed: bool = False,
     ) -> Dict[str, Any]:
+        """
+        Execute REST request with retry, rate-limit back-off, and semaphore.
+        """
         async with self._rate_limiter:
             params = params or {}
             url = f"{self.base_url}{endpoint}"
@@ -227,11 +235,10 @@ class BybitV5Client:
         """
         Retrieve ALL active linear USDT perpetual symbols on Bybit.
 
-        Fixes the documented Bybit API bug where turnover24h and
-        volume24h are occasionally returned inverted (base-asset volume
-        showing up in the turnover field). Detects the inversion by
-        comparing the two fields and reconstructs the correct quote-
-        asset turnover as volume24h × lastPrice.
+        Fixes three issues:
+          1. Field inversion — turnover24h < volume24h for price > 1
+          2. Missing turnover24h — reconstruct from volume × lastPrice
+          3. Zero turnover in bulk — query individual ticker as fallback
         """
         # ---- Step 1: fetch all instruments (paginated) -----------------
         all_instruments: List[Dict] = []
@@ -266,7 +273,7 @@ class BybitV5Client:
             f"Fetched {len(all_instruments)} total linear instruments"
         )
 
-        # ---- Step 2: apply filters with per-filter counts --------------
+        # ---- Step 2: filter by quote/status/type ------------------------
         usdt_perps: List[str] = []
         filtered = {"not_usdt": 0, "not_trading": 0, "not_perp": 0}
         for inst in all_instruments:
@@ -301,10 +308,11 @@ class BybitV5Client:
                 f"Sample ticker fields: {list(tickers[0].keys())}"
             )
 
-        # ---- Step 4: build turnover map (robust to field inversion) ----
+        # ---- Step 4: build turnover map (inversion + zero fallback) ----
         turnover_map: Dict[str, float] = {}
         inversions_detected = 0
         reconstructions = 0
+        zero_symbols: List[str] = []
 
         for t in tickers:
             sym = t.get("symbol")
@@ -319,10 +327,7 @@ class BybitV5Client:
                 turnover_map[sym] = 0.0
                 continue
 
-            # Detect field inversion: for USDT-quoted perps with price > 1,
-            # quote turnover (USDT) must exceed base volume (BTC, ETH, ...).
-            # If turnover < volume and price > 1, Bybit returned the fields
-            # swapped — reconstruct turnover from volume × price.
+            # Detect field inversion (Bybit bug: fields sometimes swapped)
             if turnover > 0 and volume > 0 and last_price > 1.0:
                 if turnover < volume:
                     turnover = volume * last_price
@@ -331,8 +336,8 @@ class BybitV5Client:
                         f"{sym}: field inversion detected — "
                         f"reconstructed turnover = {turnover:,.0f}"
                     )
+            # Missing turnover — reconstruct from volume × price
             elif turnover == 0 and volume > 0 and last_price > 0:
-                # turnover24h missing — reconstruct from volume × price
                 turnover = volume * last_price
                 reconstructions += 1
                 logger.debug(
@@ -341,6 +346,10 @@ class BybitV5Client:
                 )
 
             turnover_map[sym] = turnover
+
+            # Track zero-turnover symbols for per-symbol fallback
+            if turnover == 0.0 and sym in usdt_perps:
+                zero_symbols.append(sym)
 
         if inversions_detected:
             logger.warning(
@@ -351,6 +360,63 @@ class BybitV5Client:
             logger.info(
                 f"Turnover reconstructed for {reconstructions} symbols "
                 f"with missing turnover24h"
+            )
+
+        # ---- Step 4b: per-symbol fallback for zero-turnover symbols ----
+        if zero_symbols:
+            logger.info(
+                f"Bulk ticker returned 0 turnover for "
+                f"{len(zero_symbols)} symbols — querying individually"
+            )
+            if len(zero_symbols) <= 20:
+                logger.info(f"  Symbols: {zero_symbols}")
+            else:
+                logger.info(
+                    f"  First 20: {zero_symbols[:20]} "
+                    f"(+{len(zero_symbols)-20} more)"
+                )
+
+            fallback_fixed = 0
+            fallback_failed = 0
+
+            for sym in zero_symbols:
+                try:
+                    individual = await self.get_ticker(sym)
+                    if not individual:
+                        fallback_failed += 1
+                        continue
+
+                    turnover = float(individual.get("turnover24h") or 0)
+                    volume = float(individual.get("volume24h") or 0)
+                    last_price = float(individual.get("lastPrice") or 0)
+
+                    # Apply the same inversion logic to the individual
+                    if turnover > 0 and volume > 0 and last_price > 1.0:
+                        if turnover < volume:
+                            turnover = volume * last_price
+                    elif turnover == 0 and volume > 0 and last_price > 0:
+                        turnover = volume * last_price
+
+                    if turnover > 0:
+                        turnover_map[sym] = turnover
+                        fallback_fixed += 1
+                        logger.info(
+                            f"  {sym}: bulk=0 → individual={turnover:,.0f} USDT"
+                        )
+                    else:
+                        fallback_failed += 1
+                        logger.debug(
+                            f"  {sym}: still 0 after individual query "
+                            f"(volume={volume}, price={last_price})"
+                        )
+                except Exception as e:
+                    fallback_failed += 1
+                    logger.debug(f"  {sym}: individual ticker failed: {e}")
+
+            logger.info(
+                f"Per-symbol fallback: fixed={fallback_fixed}, "
+                f"failed={fallback_failed}, "
+                f"total_checked={len(zero_symbols)}"
             )
 
         # ---- Step 5: log top 20 by turnover ---------------------------
@@ -421,6 +487,17 @@ class BybitV5Client:
         )
         return data.get("result", {}).get("list", [])
 
+    async def get_ticker(self, symbol: str) -> Dict:
+        """Fetch a single symbol's ticker (more reliable for zero-turnover symbols)."""
+        data = await self._rest_request(
+            "GET", "/v5/market/tickers",
+            params={"category": self.cfg.category, "symbol": symbol},
+        )
+        if data.get("retCode") != 0:
+            return {}
+        lst = data.get("result", {}).get("list", [])
+        return lst[0] if lst else {}
+
     # ================================================================== #
     #  Market data (V5 public)
     # ================================================================== #
@@ -431,9 +508,7 @@ class BybitV5Client:
         limit: int = 200,
         category: Optional[str] = None,
     ) -> List[List]:
-        """
-        GET /v5/market/kline — returns [[ts, o, h, l, c, v, turnover], ...]
-        """
+        """GET /v5/market/kline — returns [[ts, o, h, l, c, v, turnover], ...]"""
         data = await self._rest_request(
             "GET", "/v5/market/kline",
             params={
