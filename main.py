@@ -69,8 +69,9 @@ class QuantBotV9:
             min_calibrated=self.config["strategy"]["min_calibrated"],
         )
         self.composite_engine = CompositeQuantEngine(
-            self.client,
-            weights=self.config.get("strategy", {}).get("composite_weights"),
+        self.client,
+        weights=self.config.get("strategy", {}).get("composite_weights"),
+        funding_config=self.config.get("funding"),
         )
 
         self.agent = DeepSeekAgent(DeepSeekConfig(
@@ -276,6 +277,7 @@ class QuantBotV9:
             bias=bias,
             llm_response=None,
             composite=composite,
+            funding_result=composite.funding,   # NEW
         )
         if prelim.raw_total < 40:
             await self.journal.log_signal({
@@ -299,6 +301,10 @@ class QuantBotV9:
                 "funding_annualized_pct": composite.basis.funding_annualized,
                 "volume_zscore": composite.volume.z_score,
                 "volume_anomaly_level": composite.volume.anomaly_level,
+                "funding_rate_pct": composite.funding.rate_pct,
+                "funding_annualized_pct": composite.funding.annualized_pct,
+                "funding_regime": composite.funding.regime,
+                "funding_contrarian_bias": composite.funding.contrarian_bias,
                 "_breakdown": {
                     "technical_score": prelim.technical_score,
                     "composite_score": prelim.composite_score,
@@ -376,6 +382,7 @@ class QuantBotV9:
             bias=bias,
             llm_response=llm_response,
             composite=composite,
+            funding_result=composite.funding,   # NEW
         )
 
         signal_id = await self.journal.log_signal({
@@ -450,7 +457,15 @@ class QuantBotV9:
                 f"Composite={composite.total_score:.2f} "
                 f"Conviction={composite.conviction}"
             ),
-            metadata={"signal_id": signal_id, "llm": llm_response},
+            metadata={
+                "signal_id": signal_id,
+                "llm": llm_response,
+                # --- NEW: funding flags for risk manager ---
+                "funding_rate_pct": composite.funding.rate_pct,
+                "funding_block_long": composite.funding.should_block_long,
+                "funding_block_short": composite.funding.should_block_short,
+                "funding_regime": composite.funding.regime,
+            },
         )
 
         result = await self.executor.execute_signal(signal)

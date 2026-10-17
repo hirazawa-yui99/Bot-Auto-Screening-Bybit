@@ -2,9 +2,9 @@
 analysis/quant_composite.py
 Composite quantitative scoring engine.
 
-Combines: mean reversion (Zeta/OU/Hurst/ADF), basis spread, volume
-anomaly, derivatives (CVD/OI/L-S), and momentum into a single
-normalized score in [−1, +1].
+Combines: mean reversion, basis spread, volume anomaly,
+derivatives (CVD/OI/L-S), funding rate, and momentum into a
+single normalized score in [−1, +1].
 """
 import logging
 from dataclasses import dataclass, field
@@ -16,6 +16,7 @@ import pandas as pd
 from analysis.mean_reversion import MeanReversionAnalyzer, MeanReversionResult
 from analysis.basis import BasisAnalyzer, BasisResult
 from analysis.volume_anomaly import VolumeAnomalyAnalyzer, VolumeAnomalyResult
+from analysis.funding import FundingAnalyzer, FundingResult
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class CompositeQuantScore:
     mean_reversion: MeanReversionResult = field(default_factory=MeanReversionResult)
     basis: BasisResult = field(default_factory=BasisResult)
     volume: VolumeAnomalyResult = field(default_factory=VolumeAnomalyResult)
+    funding: FundingResult = field(default_factory=FundingResult)
     derivative_score: float = 0.0
     total_score: float = 0.0
     direction: str = "neutral"
@@ -36,10 +38,11 @@ class CompositeQuantScore:
 
 class CompositeQuantEngine:
     DEFAULT_WEIGHTS = {
-        "mean_reversion": 0.25,
-        "basis": 0.15,
+        "mean_reversion": 0.20,
+        "basis": 0.10,
         "volume": 0.15,
-        "derivatives": 0.30,
+        "derivatives": 0.25,
+        "funding": 0.15,
         "momentum": 0.15,
     }
     NORMALIZERS = {
@@ -47,17 +50,24 @@ class CompositeQuantEngine:
         "basis": 10.0,
         "volume": 10.0,
         "derivatives": 25.0,
+        "funding": 15.0,
         "momentum": 10.0,
     }
 
-    def __init__(self, client, weights: Optional[Dict[str, float]] = None):
+    def __init__(
+        self, client, weights: Optional[Dict[str, float]] = None,
+        funding_config: Optional[Dict] = None,
+    ):
         self.client = client
         self.weights = weights or self.DEFAULT_WEIGHTS.copy()
         self.mr_analyzer = MeanReversionAnalyzer()
         self.basis_analyzer = BasisAnalyzer(client)
         self.vol_analyzer = VolumeAnomalyAnalyzer()
+        self.funding_analyzer = FundingAnalyzer(funding_config)
+
         s = sum(self.weights.values())
         if abs(s - 1.0) > 1e-6:
+            logger.warning(f"Weights sum to {s}, renormalizing")
             for k in self.weights:
                 self.weights[k] /= s
 
@@ -93,23 +103,37 @@ class CompositeQuantEngine:
             return out
         closes = df["close"].astype(float)
 
+        # 1. Mean reversion
         out.mean_reversion = self.mr_analyzer.analyze(
             closes, bar_interval_hours=bar_interval_hours,
         )
+
+        # 2. Basis spread
         try:
             out.basis = await self.basis_analyzer.compute(symbol)
         except Exception as e:
             logger.debug(f"Basis compute failed for {symbol}: {e}")
+
+        # 3. Volume anomaly
         out.volume = self.vol_analyzer.analyze(df)
+
+        # 4. Funding rate (NEW)
+        out.funding = await self.funding_analyzer.analyze(symbol, self.client)
+
+        # 5. Derivatives (CVD/OI/L-S)
         out.derivative_score = getattr(
             derivative_snapshot, "confidence_contribution", 0.0,
         )
+
+        # 6. Momentum
         momentum_contrib = self._momentum_contribution(indicators)
 
+        # Normalize each to [-1, +1]
         mr_norm = out.mean_reversion.confidence_contribution / self.NORMALIZERS["mean_reversion"]
         basis_norm = out.basis.confidence_contribution / self.NORMALIZERS["basis"]
         vol_norm = out.volume.confidence_contribution / self.NORMALIZERS["volume"]
         deriv_norm = out.derivative_score / self.NORMALIZERS["derivatives"]
+        funding_norm = out.funding.confidence_contribution / self.NORMALIZERS["funding"]
         mom_norm = momentum_contrib / self.NORMALIZERS["momentum"]
 
         out.total_score = float(np.clip(
@@ -117,6 +141,7 @@ class CompositeQuantEngine:
             + self.weights["basis"] * basis_norm
             + self.weights["volume"] * vol_norm
             + self.weights["derivatives"] * deriv_norm
+            + self.weights["funding"] * funding_norm
             + self.weights["momentum"] * mom_norm,
             -1.0, 1.0,
         ))
@@ -133,8 +158,9 @@ class CompositeQuantEngine:
             out.conviction = "medium"
 
         component_signs = [
-            np.sign(mr_norm), np.sign(basis_norm), np.sign(vol_norm),
-            np.sign(deriv_norm), np.sign(mom_norm),
+            np.sign(mr_norm), np.sign(basis_norm),
+            np.sign(vol_norm), np.sign(deriv_norm),
+            np.sign(funding_norm), np.sign(mom_norm),
         ]
         nonzero = [s for s in component_signs if s != 0]
         if nonzero:
@@ -142,7 +168,10 @@ class CompositeQuantEngine:
             agreeing = sum(1 for s in nonzero if s == dominant)
             out.agreement_ratio = agreeing / len(nonzero)
 
-        names = ["mean_reversion", "basis", "volume", "derivatives", "momentum"]
+        names = [
+            "mean_reversion", "basis", "volume",
+            "derivatives", "funding", "momentum",
+        ]
         for name, s in zip(names, component_signs):
             if s != 0 and s != np.sign(out.total_score):
                 out.conflicting_components.append(name)

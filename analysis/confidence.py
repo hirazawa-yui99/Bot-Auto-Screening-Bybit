@@ -49,15 +49,43 @@ class ConfidenceScorer:
         self._outcome_history: List[Dict] = []
 
     def check_hard_gates(
-        self, symbol: str, deriv_snapshot, klines_df,
+        self,
+        symbol: str,
+        deriv_snapshot,
+        klines_df,
+        bias: str = "",
+        funding_result=None,
     ) -> Tuple[bool, List[str]]:
         reasons = []
-        if abs(deriv_snapshot.funding_rate) > 0.0005:
-            reasons.append(f"Funding extreme: {deriv_snapshot.funding_rate:.4%}")
+
+        # ---- Funding gate (direction-aware) ----
+        if funding_result is not None:
+            # Use the analyzer's directional gate
+            from analysis.funding import FundingAnalyzer
+            reason = FundingAnalyzer.get_gate_reason(funding_result, bias)
+            if reason:
+                reasons.append(reason)
+        else:
+            # Fallback: old behavior, but direction-aware
+            rate = deriv_snapshot.funding_rate
+            if bias == "long" and rate > 0.0005:
+                reasons.append(
+                    f"Funding {rate:.4%} extreme positive — "
+                    f"longs crowded, long blocked"
+                )
+            elif bias == "short" and rate < -0.0005:
+                reasons.append(
+                    f"Funding {rate:.4%} extreme negative — "
+                    f"shorts crowded, short blocked"
+                )
+
+        # ---- Liquidity gate ----
         if klines_df is not None and len(klines_df) >= 24:
             avg_vol = klines_df["volume"].tail(24).mean()
             if avg_vol < 1_000_000:
                 reasons.append(f"Low liquidity: avg 24h vol = {avg_vol:,.0f}")
+
+        # ---- RSI gate ----
         if klines_df is not None and len(klines_df) >= 14:
             closes = klines_df["close"].tail(15).values
             delta = np.diff(closes)
@@ -66,8 +94,13 @@ class ConfidenceScorer:
             rsi = 100 - (100 / (1 + gain / loss)) if loss > 0 else 100
             if rsi > 85:
                 reasons.append(f"RSI overbought: {rsi:.1f}")
+
+        # ---- OI anomaly gate ----
         if abs(deriv_snapshot.oi_change_1h) > 15.0:
-            reasons.append(f"OI anomaly: {deriv_snapshot.oi_change_1h:.1f}% in 1h")
+            reasons.append(
+                f"OI anomaly: {deriv_snapshot.oi_change_1h:.1f}% in 1h"
+            )
+
         return len(reasons) == 0, reasons
 
     def score_technical(self, klines_df, indicators: Dict) -> float:
@@ -222,25 +255,33 @@ class ConfidenceScorer:
         bias: str,
         llm_response: Optional[Dict] = None,
         composite=None,
+        funding_result=None,           # NEW
     ) -> ConfidenceBreakdown:
         breakdown = ConfidenceBreakdown()
-        passed, reasons = self.check_hard_gates(symbol, deriv_snapshot, klines_df)
+
+        passed, reasons = self.check_hard_gates(
+            symbol, deriv_snapshot, klines_df,
+            bias=bias, funding_result=funding_result,
+        )
         breakdown.gate_reasons = reasons
         if not passed:
             breakdown.is_high_confidence = False
             return breakdown
+
         breakdown.technical_score = self.score_technical(klines_df, indicators)
         breakdown.composite_score = self.score_composite_quant(composite)
         breakdown.derivative_score = self.score_derivatives(deriv_snapshot)
         breakdown.sentiment_score = self.score_sentiment(deriv_snapshot)
         breakdown.pattern_score = self.score_patterns(patterns_detected, bias)
         breakdown.llm_score = self.score_llm(llm_response)
+
         breakdown.raw_total = (
             breakdown.technical_score + breakdown.composite_score
             + breakdown.derivative_score + breakdown.sentiment_score
             + breakdown.pattern_score + breakdown.llm_score
         )
         breakdown.calibrated_confidence = self.calibrate(breakdown.raw_total)
+
         breakdown.is_high_confidence = (
             breakdown.raw_total >= self.min_raw_threshold
             and breakdown.calibrated_confidence >= self.min_calibrated

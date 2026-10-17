@@ -539,7 +539,33 @@ class BybitV5Client:
             },
         )
         return data.get("result", {})
+        
+    async def get_order_status(
+        self, symbol: str, order_id: str,
+    ) -> Optional[Dict]:
+        """
+        Fetch current status of a single order.
 
+        Returns the order dict or None if not found.
+        Useful fields: orderStatus, cumExecQty, leavesQty, avgPrice.
+        """
+        data = await self._rest_request(
+            "GET", "/v5/order/realtime",
+            params={
+                "category": self.cfg.category,
+                "symbol": symbol,
+                "orderId": order_id,
+            },
+            signed=True,
+        )
+        if data.get("retCode") != 0:
+            logger.debug(
+                f"get_order_status failed for {symbol}/{order_id}: "
+                f"retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
+            )
+            return None
+        lst = data.get("result", {}).get("list", [])
+        return lst[0] if lst else None
     # ================================================================== #
     #  Account / Position
     # ================================================================== #

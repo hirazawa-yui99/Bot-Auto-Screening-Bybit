@@ -59,6 +59,15 @@ class RiskManager:
 
         # Risk-reward gate
         # Risk-reward gate: require TP1 >= 1R and weighted avg >= 1.5R
+        # ---- Funding-aware directional block ----
+        meta = getattr(signal, "metadata", {}) or {}
+        if signal.direction == "long" and meta.get("funding_block_long"):
+            rate = meta.get("funding_rate_pct", 0.0)
+            return False, 0.0, f"funding_long_crowded:{rate:+.3f}%"
+        if signal.direction == "short" and meta.get("funding_block_short"):
+            rate = meta.get("funding_rate_pct", 0.0)
+            return False, 0.0, f"funding_short_crowded:{rate:+.3f}%"
+            
         if hasattr(signal, "risk_reward_tp1"):
             tp1_rr = round(signal.risk_reward_tp1, 2)
             if tp1_rr < 1.0:
@@ -79,8 +88,25 @@ class RiskManager:
         leverage = getattr(signal, "leverage", 5)
         notional_cap = equity * leverage * max_pct
         size_usd = min(size_usd, notional_cap)
-
-        return True, size_usd, "approved"
+        try:
+            wallet = await self.client.get_wallet_balance()
+            usdt = next(
+                (c for c in wallet.get("list", [{}])[0].get("coin", [])
+                 if c.get("coin") == "USDT"), {}
+            )
+            available = float(usdt.get("availableToWithdraw", 0) or 0)
+        except Exception:
+            available = 0.0
+        
+        if available <= 0:
+            return False, 0.0, "no_available_balance"
+        
+        # Required initial margin = notional / leverage
+        required_margin = (signal.position_size_usd) / signal.leverage
+        if required_margin > available * 0.9:   # 10% safety buffer
+            return False, 0.0, f"insufficient_margin:{required_margin:.2f}>{available:.2f}"
+        
+        return True, signal.position_size_usd, "approved"
 
     def update_equity(self, equity: float):
         self.state.current_equity = equity
