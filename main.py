@@ -278,6 +278,36 @@ class QuantBotV9:
             composite=composite,
         )
         if prelim.raw_total < 40:
+            await self.journal.log_signal({
+                "symbol": symbol,
+                "direction": bias,
+                "timestamp": datetime.utcnow().isoformat(),
+                "entry_price": float(df["close"].iloc[-1]),
+                "raw_score": prelim.raw_total,
+                "calibrated_confidence": prelim.calibrated_confidence,
+                "is_high_confidence": False,
+                "gate_reasons": prelim.gate_reasons or ["prelim_below_40"],
+                "llm_response": {},
+                "indicators": indicators,
+                "composite_score": composite.total_score,
+                "composite_direction": composite.direction,
+                "composite_conviction": composite.conviction,
+                "zeta": composite.mean_reversion.zeta,
+                "hurst": composite.mean_reversion.hurst,
+                "half_life_hours": composite.mean_reversion.half_life_hours,
+                "basis_pct": composite.basis.basis_pct,
+                "funding_annualized_pct": composite.basis.funding_annualized,
+                "volume_zscore": composite.volume.z_score,
+                "volume_anomaly_level": composite.volume.anomaly_level,
+                "_breakdown": {
+                    "technical_score": prelim.technical_score,
+                    "composite_score": prelim.composite_score,
+                    "derivative_score": prelim.derivative_score,
+                    "sentiment_score": prelim.sentiment_score,
+                    "pattern_score": prelim.pattern_score,
+                    "llm_score": prelim.llm_score,
+                },
+            })
             return
 
         market_context = {
@@ -369,6 +399,14 @@ class QuantBotV9:
             "funding_annualized_pct": composite.basis.funding_annualized,
             "volume_zscore": composite.volume.z_score,
             "volume_anomaly_level": composite.volume.anomaly_level,
+            "_breakdown": {
+                "technical_score": final.technical_score,
+                "composite_score": final.composite_score,
+                "derivative_score": final.derivative_score,
+                "sentiment_score": final.sentiment_score,
+                "pattern_score": final.pattern_score,
+                "llm_score": final.llm_score,
+            },
         })
 
         if not final.is_high_confidence:

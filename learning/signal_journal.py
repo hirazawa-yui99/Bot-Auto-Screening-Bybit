@@ -2,6 +2,7 @@
 learning/signal_journal.py
 Persist and query signal records + outcomes.
 """
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -15,6 +16,7 @@ class SignalJournal:
         self.db = db
 
     async def log_signal(self, signal: Dict) -> int:
+        breakdown = signal.get("_breakdown") or {}
         row_id = await self.db.fetchval(
             """
             INSERT INTO signals (
@@ -23,10 +25,13 @@ class SignalJournal:
                 gate_reasons, llm_response, indicators,
                 composite_score, composite_direction, composite_conviction,
                 zeta, hurst, half_life_hours, basis_pct,
-                funding_annualized_pct, volume_zscore, volume_anomaly_level
+                funding_annualized_pct, volume_zscore, volume_anomaly_level,
+                technical_score, composite_score_pct, derivative_score,
+                sentiment_score, pattern_score, llm_score
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-                $11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+                $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                $21,$22,$23,$24,$25,$26
             ) RETURNING id
             """,
             signal["symbol"],
@@ -49,6 +54,12 @@ class SignalJournal:
             signal.get("funding_annualized_pct", 0.0),
             signal.get("volume_zscore", 0.0),
             signal.get("volume_anomaly_level", "normal"),
+            breakdown.get("technical_score", 0.0),
+            breakdown.get("composite_score", 0.0),
+            breakdown.get("derivative_score", 0.0),
+            breakdown.get("sentiment_score", 0.0),
+            breakdown.get("pattern_score", 0.0),
+            breakdown.get("llm_score", 0.0),
         )
         return int(row_id)
 
@@ -81,7 +92,6 @@ class SignalJournal:
         )
 
     def get_signals_since(self, cutoff: datetime) -> List[Dict]:
-        # Sync wrapper — for use in auto-tuner. Uses a temp event loop.
         import asyncio
         try:
             loop = asyncio.get_event_loop()

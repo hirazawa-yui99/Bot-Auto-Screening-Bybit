@@ -1,12 +1,6 @@
 """
 analysis/confidence.py
-Calibrated confidence scorer with fallacy guards.
-
-HIGH CONFIDENCE SIGNAL requires:
-  - raw_total >= MIN_RAW_THRESHOLD
-  - no hard gates triggered
-  - calibrated_confidence >= MIN_CALIBRATED
-  - at least MIN_LIVE_SAMPLES historical outcomes
+Calibrated confidence scorer with fallacy guards and bootstrap mode.
 """
 import logging
 from dataclasses import dataclass, field
@@ -42,8 +36,8 @@ class ConfidenceScorer:
 
     def __init__(
         self,
-        min_raw_threshold: float = 65.0,
-        min_calibrated: float = 0.72,
+        min_raw_threshold: float = 42.0,
+        min_calibrated: float = 0.42,
         min_live_samples: int = 30,
         shrinkage_prior: float = 0.5,
     ):
@@ -93,13 +87,19 @@ class ConfidenceScorer:
         elif ema_9 < ema_21:
             score += 4
         rsi = indicators.get("rsi", 50)
-        if 40 <= rsi <= 60: score += 5
-        elif rsi < 30: score += 6
-        elif rsi > 70: score += 3
+        if 40 <= rsi <= 60:
+            score += 5
+        elif rsi < 30:
+            score += 6
+        elif rsi > 70:
+            score += 3
         rvol = indicators.get("rvol", 1.0)
-        if rvol >= 2.0: score += 7
-        elif rvol >= 1.5: score += 4
-        elif rvol >= 1.0: score += 2
+        if rvol >= 2.0:
+            score += 7
+        elif rvol >= 1.5:
+            score += 4
+        elif rvol >= 1.0:
+            score += 2
         return float(np.clip(score, 0, self.WEIGHT_TECHNICAL))
 
     def score_composite_quant(self, composite) -> float:
@@ -150,6 +150,9 @@ class ConfidenceScorer:
     def score_llm(self, llm_response: Dict) -> float:
         if not llm_response:
             return 0.0
+        # Neutral placeholder from disabled LLM gets a neutral score
+        if llm_response.get("_llm_unavailable"):
+            return 5.0
         score = 5.0
         if llm_response.get("agrees_with_quant"):
             score += 3
@@ -166,23 +169,40 @@ class ConfidenceScorer:
         return f"{int(raw_score // 10) * 10}-{int(raw_score // 10) * 10 + 10}"
 
     def calibrate(self, raw_score: float) -> float:
+        """
+        Calibrate raw score → confidence using historical outcomes.
+
+        Bootstrap (n == 0): use raw_score / 100 capped at 0.85.
+        Shrinkage (0 < n < 30): blend historical WR with raw proxy.
+        Full (n >= 30): historical win rate only.
+        """
         bucket = self._bucket_key(raw_score)
-        n = len([o for o in self._outcome_history
-                 if self._bucket_key(o["raw_score"]) == bucket])
-        if n < self.min_live_samples:
-            if n == 0:
-                return self.shrinkage_prior
-            historical_wr = np.mean([
-                o["won"] for o in self._outcome_history
-                if self._bucket_key(o["raw_score"]) == bucket
-            ])
-            alpha = n / (n + self.min_live_samples)
-            return float(alpha * historical_wr + (1 - alpha) * self.shrinkage_prior)
-        historical_wr = np.mean([
-            o["won"] for o in self._outcome_history
+        bucket_outcomes = [
+            o for o in self._outcome_history
             if self._bucket_key(o["raw_score"]) == bucket
-        ])
-        return float(historical_wr)
+        ]
+        n = len(bucket_outcomes)
+        raw_proxy = min(0.85, max(0.30, raw_score / 100.0))
+
+        if n == 0:
+            logger.debug(
+                f"Calibration bootstrap (n=0): raw={raw_score:.1f} "
+                f"→ confidence={raw_proxy:.2f}"
+            )
+            return raw_proxy
+
+        historical_wr = sum(1 for o in bucket_outcomes if o["won"]) / n
+
+        if n < self.min_live_samples:
+            alpha = n / self.min_live_samples
+            blended = alpha * historical_wr + (1 - alpha) * raw_proxy
+            logger.debug(
+                f"Calibration blend (n={n}): historical={historical_wr:.2f}, "
+                f"raw_proxy={raw_proxy:.2f} → {blended:.2f}"
+            )
+            return blended
+
+        return historical_wr
 
     def record_outcome(self, raw_score: float, won: bool, metadata: Dict = None):
         self._outcome_history.append({
