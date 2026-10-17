@@ -34,6 +34,7 @@ from learning.outcome_tracker import OutcomeTracker
 from learning.auto_tuner import AutoTuner
 from notification.discord_bot import DiscordNotifier
 from persistence.database import Database
+import math 
 
 logging.basicConfig(
     level=logging.INFO,
