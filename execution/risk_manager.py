@@ -59,8 +59,10 @@ class RiskManager:
 
         # Risk-reward gate
         # Risk-reward gate: require TP1 >= 1R and weighted avg >= 1.5R
-        if hasattr(signal, "risk_reward_tp1") and signal.risk_reward_tp1 < 1.0:
-            return False, 0.0, f"tp1_rr_too_low:{signal.risk_reward_tp1:.2f}"
+        if hasattr(signal, "risk_reward_tp1"):
+            tp1_rr = round(signal.risk_reward_tp1, 2)
+            if tp1_rr < 1.0:
+                return False, 0.0, f"tp1_rr_too_low:{tp1_rr:.2f}"
         if hasattr(signal, "risk_reward") and signal.risk_reward < 1.5:
             return False, 0.0, f"weighted_rr_too_low:{signal.risk_reward:.2f}"
 

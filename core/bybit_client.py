@@ -5,17 +5,8 @@ Bybit V5 Unified Trading API client.
 Handles REST (market data, account, instruments) and WebSocket
 (order execution via Trade WS, private streams via Private WS).
 
-Reference: https://bybit-exchange.github.io/docs/v5/intro
-
-Endpoints used:
-  REST base     : https://api.bybit.com        (testnet: https://api-testnet.bybit.com)
-  WS public     : wss://stream.bybit.com/v5/public/{category}
-  WS private    : wss://stream.bybit.com/v5/private
-  WS trade      : wss://stream.bybit.com/v5/trade
-
-Auth response schemas (IMPORTANT — they differ):
-  Trade WS   : {"retCode": 0, "retMsg": "OK",  "op": "auth", ...}
-  Private WS : {"success": true, "ret_msg": "", "op": "auth", ...}
+Includes per-symbol instrument filter caching (qtyStep, tickSize,
+minOrderQty, minNotionalValue) so orders are rounded correctly.
 """
 
 import asyncio
@@ -23,9 +14,10 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 import websockets
@@ -33,17 +25,8 @@ import websockets
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------- #
-#  Module-level helpers
-# --------------------------------------------------------------------- #
 def _ws_is_open(ws) -> bool:
-    """
-    Return True if a websockets connection is open.
-
-    Handles both API versions:
-      - websockets < 12  : legacy WebSocketClientProtocol → .closed
-      - websockets >= 12 : new ClientConnection          → .state
-    """
+    """Return True if a websockets connection is open (v11 or v12 API)."""
     if ws is None:
         return False
     if hasattr(ws, "closed"):
@@ -69,18 +52,27 @@ class BybitConfig:
     retry_backoff: float = 1.5
 
 
+@dataclass
+class InstrumentFilter:
+    """Per-symbol constraints from /v5/market/instruments-info."""
+    symbol: str
+    qty_step: float = 0.001
+    min_order_qty: float = 0.001
+    max_order_qty: float = 1e9
+    min_notional: float = 5.0         # USDT
+    tick_size: float = 0.01
+    price_scale: int = 2
+    qty_scale: int = 3
+
+
 class BybitV5Client:
     """
-    Unified Bybit V5 client with full-symbol scanning support.
-
-    REST limits (per Bybit docs):
-      - HTTP IP limit: 600 req / 5s window across all api.bybit.com hosts
-      - Tickers/Kline: ~10 req/s per IP
-    We hold a semaphore at 8 concurrent requests to stay well within bounds.
+    Unified Bybit V5 client with full-symbol scanning and instrument
+    filter caching.
     """
 
     REST_BASE = "https://api.bybit.com"
-    REST_TESTNET = "https://api.bybit.com"
+    REST_TESTNET = "https://api-testnet.bybit.com"
     WS_PUBLIC = "wss://stream.bybit.com/v5/public/{category}"
     WS_PRIVATE = "wss://stream.bybit.com/v5/private"
     WS_TRADE = "wss://stream.bybit.com/v5/trade"
@@ -94,7 +86,9 @@ class BybitV5Client:
         self._ws_trade = None
         self._subscriptions: Dict[str, Callable] = {}
         self._running = False
-        self._rate_limiter = asyncio.Semaphore(8)
+        self._rate_limiter = asyncio.Semaphore(3)
+        self._ws_trade_lock = asyncio.Lock()
+        self._instrument_filters: Dict[str, InstrumentFilter] = {}
 
     # ================================================================== #
     #  REST helpers
@@ -124,10 +118,9 @@ class BybitV5Client:
         params: Optional[Dict] = None,
         signed: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Execute REST request with retry, rate-limit back-off, and semaphore.
-        """
         async with self._rate_limiter:
+            await asyncio.sleep(0.1)      # pacing to avoid 403 rate-limits
+
             params = params or {}
             url = f"{self.base_url}{endpoint}"
             headers = {"Content-Type": "application/json"}
@@ -186,15 +179,16 @@ class BybitV5Client:
 
                         if data.get("retCode") == 10006:
                             wait = self.cfg.retry_backoff ** (attempt + 1)
-                            logger.warning(
-                                f"Rate limited. Waiting {wait:.1f}s"
-                            )
+                            logger.warning(f"Rate limited. Waiting {wait:.1f}s")
                             await asyncio.sleep(wait)
                             continue
 
-                        if data.get("retCode") != 0:
-                            code = data.get("retCode")
-                            if code in (10001, 10002):
+                        code = data.get("retCode")
+                        if code != 0:
+                            # 10001 = invalid param / symbol
+                            # 10002 = invalid api key
+                            # 110043 = leverage not modified (idempotent)
+                            if code in (10001, 10002, 110043):
                                 logger.debug(
                                     f"Bybit retCode {code} for "
                                     f"endpoint={endpoint}: "
@@ -224,6 +218,132 @@ class BybitV5Client:
             )
 
     # ================================================================== #
+    #  INSTRUMENT FILTER CACHE
+    # ================================================================== #
+    async def load_instrument_filters(self, symbols: Optional[List[str]] = None):
+        """
+        Fetch and cache qtyStep, tickSize, minOrderQty, minNotional
+        for all (or specified) linear symbols.
+
+        Call once at startup and periodically to refresh.
+        """
+        all_filters: Dict[str, InstrumentFilter] = {}
+        cursor: Optional[str] = None
+        page = 0
+
+        while True:
+            params: Dict[str, Any] = {"category": self.cfg.category, "limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+
+            data = await self._rest_request(
+                "GET", "/v5/market/instruments-info", params=params,
+            )
+            result = data.get("result", {})
+            batch = result.get("list", [])
+            if not batch:
+                break
+
+            for inst in batch:
+                sym = inst.get("symbol")
+                if not sym:
+                    continue
+                if symbols and sym not in symbols:
+                    continue
+
+                lot = inst.get("lotSizeFilter", {}) or {}
+                price = inst.get("priceFilter", {}) or {}
+
+                try:
+                    qty_step = float(lot.get("qtyStep", 0.001) or 0.001)
+                    min_qty = float(lot.get("minOrderQty", 0.001) or 0.001)
+                    max_qty = float(lot.get("maxOrderQty", 1e9) or 1e9)
+                    min_notional = float(
+                        lot.get("minNotionalValue", 5.0) or 5.0
+                    )
+                    tick_size = float(price.get("tickSize", 0.01) or 0.01)
+
+                    qty_scale = max(0, -int(math.floor(math.log10(qty_step))))
+                    price_scale = max(0, -int(math.floor(math.log10(tick_size))))
+
+                    all_filters[sym] = InstrumentFilter(
+                        symbol=sym,
+                        qty_step=qty_step,
+                        min_order_qty=min_qty,
+                        max_order_qty=max_qty,
+                        min_notional=min_notional,
+                        tick_size=tick_size,
+                        price_scale=price_scale,
+                        qty_scale=qty_scale,
+                    )
+                except (TypeError, ValueError) as e:
+                    logger.debug(f"Filter parse failed for {sym}: {e}")
+
+            cursor = result.get("nextPageCursor")
+            page += 1
+            if not cursor:
+                break
+            await asyncio.sleep(0.15)
+
+        self._instrument_filters = all_filters
+        logger.info(
+            f"Loaded instrument filters for {len(all_filters)} symbols"
+        )
+
+    def get_filter(self, symbol: str) -> Optional[InstrumentFilter]:
+        """Return cached filter, or None if not loaded."""
+        return self._instrument_filters.get(symbol)
+
+    def round_qty(self, symbol: str, qty: float) -> Tuple[float, str]:
+        """
+        Round qty DOWN to the nearest qtyStep. Returns (rounded_qty, reason).
+        Returns (0.0, reason) if the qty is invalid (below min / above max).
+        """
+        f = self._instrument_filters.get(symbol)
+        if f is None:
+            # Fallback: round to 3 decimals if filters not loaded
+            rounded = math.floor(qty * 1000) / 1000
+            return rounded, "no_filter_fallback"
+
+        if qty < f.min_order_qty:
+            return 0.0, f"below_min_qty({qty:.6f}<{f.min_order_qty})"
+        if qty > f.max_order_qty:
+            qty = f.max_order_qty
+
+        # Round DOWN to nearest qtyStep
+        steps = math.floor(qty / f.qty_step)
+        rounded = steps * f.qty_step
+        rounded = round(rounded, f.qty_scale)
+
+        if rounded < f.min_order_qty:
+            return 0.0, f"rounded_below_min({rounded}<{f.min_order_qty})"
+
+        return rounded, "ok"
+
+    def round_price(self, symbol: str, price: float) -> float:
+        """Round price to the nearest tickSize."""
+        f = self._instrument_filters.get(symbol)
+        if f is None:
+            return round(price, 6)
+        tick = f.tick_size
+        rounded = round(price / tick) * tick
+        return round(rounded, f.price_scale)
+
+    def validate_notional(
+        self, symbol: str, qty: float, price: float,
+    ) -> Tuple[bool, str]:
+        """Check that qty × price >= minNotionalValue."""
+        f = self._instrument_filters.get(symbol)
+        if f is None:
+            return True, "no_filter"
+        notional = qty * price
+        if notional < f.min_notional:
+            return False, (
+                f"notional_too_low({notional:.2f}<{f.min_notional})"
+            )
+        return True, "ok"
+
+    # ================================================================== #
     #  FULL-PAIR SCANNER
     # ================================================================== #
     async def get_all_linear_symbols(
@@ -232,15 +352,7 @@ class BybitV5Client:
         only_perpetual: bool = True,
         min_turnover_24h: float = 5_000_000,
     ) -> List[str]:
-        """
-        Retrieve ALL active linear USDT perpetual symbols on Bybit.
-
-        Fixes three issues:
-          1. Field inversion — turnover24h < volume24h for price > 1
-          2. Missing turnover24h — reconstruct from volume × lastPrice
-          3. Zero turnover in bulk — query individual ticker as fallback
-        """
-        # ---- Step 1: fetch all instruments (paginated) -----------------
+        """Fetch all active linear USDT perpetuals with turnover filtering."""
         all_instruments: List[Dict] = []
         cursor: Optional[str] = None
         page = 0
@@ -269,56 +381,31 @@ class BybitV5Client:
                 break
             await asyncio.sleep(0.15)
 
-        logger.info(
-            f"Fetched {len(all_instruments)} total linear instruments"
-        )
-
-        # ---- Step 2: filter by quote/status/type ------------------------
         usdt_perps: List[str] = []
-        filtered = {"not_usdt": 0, "not_trading": 0, "not_perp": 0}
         for inst in all_instruments:
             if inst.get("quoteCoin") != quote_coin:
-                filtered["not_usdt"] += 1
                 continue
             if inst.get("status") != "Trading":
-                filtered["not_trading"] += 1
                 continue
             if only_perpetual and inst.get("contractType") != "LinearPerpetual":
-                filtered["not_perp"] += 1
                 continue
             usdt_perps.append(inst["symbol"])
 
-        logger.info(
-            f"After quote/status/type filters: {len(usdt_perps)} symbols "
-            f"(dropped: not_usdt={filtered['not_usdt']}, "
-            f"not_trading={filtered['not_trading']}, "
-            f"not_perp={filtered['not_perp']})"
-        )
+        logger.info(f"After filters: {len(usdt_perps)} USDT perpetuals")
 
         if not usdt_perps:
-            logger.error("No USDT perpetuals found — aborting scan")
             return []
 
-        # ---- Step 3: fetch all tickers (batched) -----------------------
         tickers = await self.get_all_tickers(category="linear")
-        logger.info(f"Fetched {len(tickers)} tickers for linear category")
+        logger.info(f"Fetched {len(tickers)} tickers")
 
-        if tickers:
-            logger.info(
-                f"Sample ticker fields: {list(tickers[0].keys())}"
-            )
-
-        # ---- Step 4: build turnover map (inversion + zero fallback) ----
         turnover_map: Dict[str, float] = {}
-        inversions_detected = 0
-        reconstructions = 0
         zero_symbols: List[str] = []
 
         for t in tickers:
             sym = t.get("symbol")
             if not sym:
                 continue
-
             try:
                 turnover = float(t.get("turnover24h") or 0)
                 volume = float(t.get("volume24h") or 0)
@@ -327,168 +414,56 @@ class BybitV5Client:
                 turnover_map[sym] = 0.0
                 continue
 
-            # Detect field inversion (Bybit bug: fields sometimes swapped)
             if turnover > 0 and volume > 0 and last_price > 1.0:
                 if turnover < volume:
                     turnover = volume * last_price
-                    inversions_detected += 1
-                    logger.debug(
-                        f"{sym}: field inversion detected — "
-                        f"reconstructed turnover = {turnover:,.0f}"
-                    )
-            # Missing turnover — reconstruct from volume × price
             elif turnover == 0 and volume > 0 and last_price > 0:
                 turnover = volume * last_price
-                reconstructions += 1
-                logger.debug(
-                    f"{sym}: turnover missing — "
-                    f"reconstructed = {turnover:,.0f}"
-                )
 
             turnover_map[sym] = turnover
-
-            # Track zero-turnover symbols for per-symbol fallback
             if turnover == 0.0 and sym in usdt_perps:
                 zero_symbols.append(sym)
 
-        if inversions_detected:
-            logger.warning(
-                f"Field inversion detected on {inversions_detected} symbols "
-                f"— turnover reconstructed from volume × price"
-            )
-        if reconstructions:
-            logger.info(
-                f"Turnover reconstructed for {reconstructions} symbols "
-                f"with missing turnover24h"
-            )
-
-        # ---- Step 4b: per-symbol fallback for zero-turnover symbols ----
+        # Per-symbol fallback for zero-turnover symbols
         if zero_symbols:
-            logger.info(
-                f"Bulk ticker returned 0 turnover for "
-                f"{len(zero_symbols)} symbols — querying individually"
-            )
-            if len(zero_symbols) <= 20:
-                logger.info(f"  Symbols: {zero_symbols}")
-            else:
-                logger.info(
-                    f"  First 20: {zero_symbols[:20]} "
-                    f"(+{len(zero_symbols)-20} more)"
-                )
-
-            fallback_fixed = 0
-            fallback_failed = 0
-
+            logger.info(f"Fallback for {len(zero_symbols)} zero-turnover symbols")
             for sym in zero_symbols:
                 try:
                     individual = await self.get_ticker(sym)
                     if not individual:
-                        fallback_failed += 1
                         continue
-
                     turnover = float(individual.get("turnover24h") or 0)
                     volume = float(individual.get("volume24h") or 0)
                     last_price = float(individual.get("lastPrice") or 0)
-
-                    # Apply the same inversion logic to the individual
                     if turnover > 0 and volume > 0 and last_price > 1.0:
                         if turnover < volume:
                             turnover = volume * last_price
                     elif turnover == 0 and volume > 0 and last_price > 0:
                         turnover = volume * last_price
-
                     if turnover > 0:
                         turnover_map[sym] = turnover
-                        fallback_fixed += 1
-                        logger.info(
-                            f"  {sym}: bulk=0 → individual={turnover:,.0f} USDT"
-                        )
-                    else:
-                        fallback_failed += 1
-                        logger.debug(
-                            f"  {sym}: still 0 after individual query "
-                            f"(volume={volume}, price={last_price})"
-                        )
                 except Exception as e:
-                    fallback_failed += 1
-                    logger.debug(f"  {sym}: individual ticker failed: {e}")
+                    logger.debug(f"Fallback failed for {sym}: {e}")
 
-            logger.info(
-                f"Per-symbol fallback: fixed={fallback_fixed}, "
-                f"failed={fallback_failed}, "
-                f"total_checked={len(zero_symbols)}"
-            )
-
-        # ---- Step 5: log top 20 by turnover ---------------------------
-        if turnover_map:
-            top_sorted = sorted(
-                turnover_map.items(), key=lambda x: x[1], reverse=True
-            )[:20]
-            logger.info("Top 20 symbols by corrected turnover24h:")
-            for sym, val in top_sorted:
-                logger.info(f"  {sym:25s}  {val:>20,.0f} USDT")
-
-        # ---- Step 6: near-miss diagnostic ------------------------------
-        if turnover_map:
-            near_miss = [
-                (s, turnover_map.get(s, 0))
-                for s in usdt_perps
-                if 100_000 <= turnover_map.get(s, 0) < min_turnover_24h
-            ]
-            near_miss.sort(key=lambda x: x[1], reverse=True)
-            logger.info(
-                f"Near-miss perpetuals (100k-{min_turnover_24h:,.0f}): "
-                f"{len(near_miss)} symbols"
-            )
-            for sym, val in near_miss[:10]:
-                logger.info(f"  {sym:25s}  {val:>20,.0f} USDT")
-
-        # ---- Step 7: filter by turnover --------------------------------
-        if min_turnover_24h > 0:
-            if not turnover_map:
-                logger.error(
-                    "Ticker fetch returned no usable data — "
-                    "skipping liquidity filter to keep the bot running"
-                )
-                symbols = usdt_perps
-            else:
-                symbols = [
-                    s for s in usdt_perps
-                    if turnover_map.get(s, 0) >= min_turnover_24h
-                ]
-                symbols.sort(
-                    key=lambda s: turnover_map.get(s, 0), reverse=True,
-                )
-                logger.info("Top 5 after correction:")
-                for sym in symbols[:5]:
-                    logger.info(
-                        f"  {sym:25s}  {turnover_map[sym]:>20,.0f} USDT"
-                    )
-        else:
-            symbols = usdt_perps
-            symbols.sort()
+        symbols = [
+            s for s in usdt_perps
+            if turnover_map.get(s, 0) >= min_turnover_24h
+        ]
+        symbols.sort(key=lambda s: turnover_map.get(s, 0), reverse=True)
 
         logger.info(
             f"Filtered to {len(symbols)} {quote_coin} perpetuals with "
             f">{min_turnover_24h:,.0f} 24h turnover"
         )
-
-        if symbols:
-            logger.info(f"First 10 final symbols: {symbols[:10]}")
-
         return symbols
 
-    async def get_all_tickers(
-        self, category: str = "linear"
-    ) -> List[Dict]:
-        """Fetch ALL tickers in one request (omit `symbol` param)."""
+    async def get_all_tickers(self, category: str = "linear") -> List[Dict]:
         data = await self._rest_request(
             "GET", "/v5/market/tickers", params={"category": category},
         )
         return data.get("result", {}).get("list", [])
 
     async def get_ticker(self, symbol: str) -> Dict:
-        """Fetch a single symbol's ticker (more reliable for zero-turnover symbols)."""
         data = await self._rest_request(
             "GET", "/v5/market/tickers",
             params={"category": self.cfg.category, "symbol": symbol},
@@ -499,16 +474,12 @@ class BybitV5Client:
         return lst[0] if lst else {}
 
     # ================================================================== #
-    #  Market data (V5 public)
+    #  Market data
     # ================================================================== #
     async def get_klines(
-        self,
-        symbol: str,
-        interval: str = "60",
-        limit: int = 200,
+        self, symbol: str, interval: str = "60", limit: int = 200,
         category: Optional[str] = None,
     ) -> List[List]:
-        """GET /v5/market/kline — returns [[ts, o, h, l, c, v, turnover], ...]"""
         data = await self._rest_request(
             "GET", "/v5/market/kline",
             params={
@@ -521,12 +492,8 @@ class BybitV5Client:
         return data.get("result", {}).get("list", [])
 
     async def get_open_interest(
-        self,
-        symbol: str,
-        interval_time: str = "1h",
-        limit: int = 50,
+        self, symbol: str, interval_time: str = "1h", limit: int = 50,
     ) -> List[Dict]:
-        """GET /v5/market/open-interest"""
         data = await self._rest_request(
             "GET", "/v5/market/open-interest",
             params={
@@ -541,7 +508,6 @@ class BybitV5Client:
     async def get_account_ratio(
         self, symbol: str, period: str = "1h", limit: int = 50,
     ) -> List[Dict]:
-        """GET /v5/market/account-ratio — Account Long/Short Ratio."""
         data = await self._rest_request(
             "GET", "/v5/market/account-ratio",
             params={
@@ -554,24 +520,16 @@ class BybitV5Client:
         return data.get("result", {}).get("list", [])
 
     async def get_funding_rate(self, symbol: str) -> Dict:
-        """GET /v5/market/tickers?symbol=X — extract funding fields."""
         data = await self._rest_request(
             "GET", "/v5/market/tickers",
             params={"category": self.cfg.category, "symbol": symbol},
         )
-
-        if data.get("retCode") == 10001:
-            logger.debug(
-                f"Ticker unavailable for {symbol} "
-                f"(retCode 10001) — skipping"
-            )
+        if data.get("retCode") != 0:
             return {}
-
-        tickers = data.get("result", {}).get("list", [])
-        return tickers[0] if tickers else {}
+        lst = data.get("result", {}).get("list", [])
+        return lst[0] if lst else {}
 
     async def get_orderbook(self, symbol: str, limit: int = 50) -> Dict:
-        """GET /v5/market/orderbook"""
         data = await self._rest_request(
             "GET", "/v5/market/orderbook",
             params={
@@ -583,20 +541,16 @@ class BybitV5Client:
         return data.get("result", {})
 
     # ================================================================== #
-    #  Account / Position (V5 private)
+    #  Account / Position
     # ================================================================== #
-    async def get_wallet_balance(
-        self, account_type: str = "UNIFIED",
-    ) -> Dict:
+    async def get_wallet_balance(self, account_type: str = "UNIFIED") -> Dict:
         data = await self._rest_request(
             "GET", "/v5/account/wallet-balance",
             params={"accountType": account_type}, signed=True,
         )
         return data.get("result", {})
 
-    async def get_positions(
-        self, symbol: Optional[str] = None,
-    ) -> List[Dict]:
+    async def get_positions(self, symbol: Optional[str] = None) -> List[Dict]:
         params: Dict[str, Any] = {
             "category": self.cfg.category,
             "settleCoin": "USDT",
@@ -621,12 +575,12 @@ class BybitV5Client:
         )
 
     # ================================================================== #
-    #  Order execution (WS Trade API)
+    #  Order execution
     # ================================================================== #
     async def place_order_ws(
         self,
         symbol: str,
-        side: str,                 # "Buy" | "Sell"
+        side: str,
         qty: float,
         order_type: str = "Market",
         price: Optional[float] = None,
@@ -637,9 +591,20 @@ class BybitV5Client:
         tpsl_mode: str = "Full",
         reduce_only: bool = False,
     ) -> Dict:
-        """Place order via V5 WebSocket Trade API with native TP/SL."""
+        """Place order via WS Trade API with automatic qty/price rounding."""
         if not _ws_is_open(self._ws_trade):
             await self._connect_ws_trade()
+
+        # ---- Round qty to symbol's qtyStep ----
+        rounded_qty, reason = self.round_qty(symbol, qty)
+        if rounded_qty <= 0:
+            logger.error(f"Qty rounding failed for {symbol}: {reason} (raw={qty})")
+            return {"retCode": -1, "retMsg": f"qty_invalid: {reason}"}
+
+        # ---- Round prices to tickSize ----
+        tp_rounded = self.round_price(symbol, take_profit) if take_profit else None
+        sl_rounded = self.round_price(symbol, stop_loss) if stop_loss else None
+        price_rounded = self.round_price(symbol, price) if price else None
 
         req_id = f"order_{int(time.time() * 1000)}"
         now_ms = str(int(time.time() * 1000))
@@ -656,34 +621,35 @@ class BybitV5Client:
                 "symbol": symbol,
                 "side": side,
                 "orderType": order_type,
-                "qty": str(qty),
+                "qty": str(rounded_qty),
                 "timeInForce": "IOC" if order_type == "Market" else "GTC",
                 "reduceOnly": reduce_only,
             }],
         }
 
-        if take_profit is not None:
-            payload["args"][0]["takeProfit"] = str(take_profit)
+        if tp_rounded is not None:
+            payload["args"][0]["takeProfit"] = str(tp_rounded)
             payload["args"][0]["tpTriggerBy"] = tp_trigger_by
             payload["args"][0]["tpOrderType"] = "Market"
-        if stop_loss is not None:
-            payload["args"][0]["stopLoss"] = str(stop_loss)
+        if sl_rounded is not None:
+            payload["args"][0]["stopLoss"] = str(sl_rounded)
             payload["args"][0]["slTriggerBy"] = sl_trigger_by
             payload["args"][0]["slOrderType"] = "Market"
-        if take_profit is not None or stop_loss is not None:
+        if tp_rounded is not None or sl_rounded is not None:
             payload["args"][0]["tpslMode"] = tpsl_mode
-        if price is not None and order_type == "Limit":
-            payload["args"][0]["price"] = str(price)
+        if price_rounded is not None and order_type == "Limit":
+            payload["args"][0]["price"] = str(price_rounded)
 
         logger.info(f"WS place_order: {json.dumps(payload)}")
-        await self._ws_trade.send(json.dumps(payload))
-        response = await asyncio.wait_for(
-            self._ws_trade.recv(), timeout=10,
-        )
+
+        async with self._ws_trade_lock:
+            await self._ws_trade.send(json.dumps(payload))
+            response = await asyncio.wait_for(
+                self._ws_trade.recv(), timeout=10,
+            )
         return json.loads(response)
 
     async def cancel_order_ws(self, symbol: str, order_id: str) -> Dict:
-        """Cancel an order via WS Trade API."""
         if not _ws_is_open(self._ws_trade):
             await self._connect_ws_trade()
 
@@ -701,8 +667,9 @@ class BybitV5Client:
                 "orderId": order_id,
             }],
         }
-        await self._ws_trade.send(json.dumps(payload))
-        response = await asyncio.wait_for(self._ws_trade.recv(), timeout=10)
+        async with self._ws_trade_lock:
+            await self._ws_trade.send(json.dumps(payload))
+            response = await asyncio.wait_for(self._ws_trade.recv(), timeout=10)
         return json.loads(response)
 
     async def set_trading_stop(
@@ -714,7 +681,6 @@ class BybitV5Client:
         tp_trigger_by: str = "LastPrice",
         sl_trigger_by: str = "LastPrice",
     ) -> Dict:
-        """Update TP/SL for an existing position via REST."""
         params: Dict[str, Any] = {
             "category": self.cfg.category,
             "symbol": symbol,
@@ -723,11 +689,13 @@ class BybitV5Client:
             "slTriggerBy": sl_trigger_by,
         }
         if take_profit is not None:
-            params["takeProfit"] = str(take_profit)
+            params["takeProfit"] = str(self.round_price(symbol, take_profit))
         if stop_loss is not None:
-            params["stopLoss"] = str(stop_loss)
+            params["stopLoss"] = str(self.round_price(symbol, stop_loss))
         if trailing_stop is not None:
-            params["trailingStop"] = str(trailing_stop)
+            params["trailingStop"] = str(
+                self.round_price(symbol, trailing_stop)
+            )
 
         return await self._rest_request(
             "POST", "/v5/position/trading-stop",
@@ -737,7 +705,6 @@ class BybitV5Client:
     async def close_position_market(
         self, symbol: str, side: str, qty: float,
     ) -> Dict:
-        """Emergency close: market order in opposite direction."""
         close_side = "Sell" if side == "Buy" else "Buy"
         return await self.place_order_ws(
             symbol=symbol,
@@ -751,62 +718,44 @@ class BybitV5Client:
     #  WebSocket auth helpers
     # ================================================================== #
     async def _await_op_response(
-        self,
-        ws,
-        expected_op: str,
-        timeout: float = 10.0,
+        self, ws, expected_op: str, timeout: float = 10.0,
     ) -> dict:
-        """Read WebSocket messages until we see the expected `op`."""
         timeout = float(timeout)
         deadline = time.time() + timeout
-
         while time.time() < deadline:
             remaining = max(0.5, deadline - time.time())
             raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             msg = json.loads(raw)
             if msg.get("op") == expected_op:
                 return msg
-
         raise TimeoutError(
             f"No '{expected_op}' response within {timeout:.1f}s"
         )
 
     def _is_auth_ok(self, resp: dict) -> tuple:
-        """Check auth response from either WS endpoint."""
         if "retCode" in resp:
             ok = resp.get("retCode") == 0
             return ok, "" if ok else resp.get("retMsg", "")
-
         if "success" in resp:
             ok = bool(resp.get("success"))
             return ok, "" if ok else resp.get("ret_msg", "")
-
         return False, f"unrecognised auth response: {resp}"
 
-    # ================================================================== #
-    #  WebSocket connections
-    # ================================================================== #
     async def _connect_ws_trade(self):
-        """Authenticate and connect to V5 Trade WS."""
         self._ws_trade = await websockets.connect(
             self.WS_TRADE, ping_interval=20, ping_timeout=10,
         )
-
         expires = int((time.time() + 60) * 1000)
         signature = hmac.new(
             self.cfg.api_secret.encode(),
             f"GET/realtime{expires}".encode(),
             hashlib.sha256,
         ).hexdigest()
-
         await self._ws_trade.send(json.dumps({
             "op": "auth",
             "args": [self.cfg.api_key, expires, signature],
         }))
-
-        auth_resp = await self._await_op_response(
-            self._ws_trade, "auth",
-        )
+        auth_resp = await self._await_op_response(self._ws_trade, "auth")
         ok, err = self._is_auth_ok(auth_resp)
         if not ok:
             raise ConnectionError(
@@ -815,26 +764,20 @@ class BybitV5Client:
         logger.info("WS Trade authenticated successfully")
 
     async def _connect_ws_private(self):
-        """Authenticate and connect to V5 Private WS."""
         self._ws_private = await websockets.connect(
             self.WS_PRIVATE, ping_interval=20, ping_timeout=10,
         )
-
         expires = int((time.time() + 60) * 1000)
         signature = hmac.new(
             self.cfg.api_secret.encode(),
             f"GET/realtime{expires}".encode(),
             hashlib.sha256,
         ).hexdigest()
-
         await self._ws_private.send(json.dumps({
             "op": "auth",
             "args": [self.cfg.api_key, expires, signature],
         }))
-
-        auth_resp = await self._await_op_response(
-            self._ws_private, "auth",
-        )
+        auth_resp = await self._await_op_response(self._ws_private, "auth")
         ok, err = self._is_auth_ok(auth_resp)
         if not ok:
             raise ConnectionError(
@@ -845,10 +788,8 @@ class BybitV5Client:
     async def subscribe_private(
         self, topics: List[str], callback: Callable,
     ):
-        """Subscribe to private topics: position, order, execution, wallet."""
         if not _ws_is_open(self._ws_private):
             await self._connect_ws_private()
-
         await self._ws_private.send(
             json.dumps({"op": "subscribe", "args": topics})
         )
@@ -857,10 +798,7 @@ class BybitV5Client:
         asyncio.create_task(self._private_listener())
 
     async def _private_listener(self):
-        while (
-            self._running
-            and _ws_is_open(self._ws_private)
-        ):
+        while self._running and _ws_is_open(self._ws_private):
             try:
                 msg = json.loads(await self._ws_private.recv())
                 topic = msg.get("topic", "")
@@ -880,12 +818,10 @@ class BybitV5Client:
                 logger.error(f"Private WS listener error: {e}")
                 await asyncio.sleep(1)
 
-    # ================================================================== #
-    #  Lifecycle
-    # ================================================================== #
     async def start(self):
         self._running = True
         await self._connect_ws_trade()
+        await self.load_instrument_filters()   # ← load filters at startup
 
     async def stop(self):
         self._running = False
