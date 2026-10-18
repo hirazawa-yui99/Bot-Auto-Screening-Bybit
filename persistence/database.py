@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS basis_history (
     ts              TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_basis_symbol_ts ON basis_history(symbol, ts DESC);
+CREATE TABLE IF NOT EXISTS signal_cooldowns (
+    symbol          VARCHAR(32) PRIMARY KEY,
+    alerted_at      TIMESTAMPTZ NOT NULL,
+    direction       VARCHAR(8),
+    confidence      DOUBLE PRECISION,
+    signal_id       BIGINT
+);
 """
 
 

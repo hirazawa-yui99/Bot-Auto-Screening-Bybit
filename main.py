@@ -63,6 +63,16 @@ class QuantBotV9:
             testnet=self.config["api"].get("testnet", False),
             category="linear",
         ))
+        self._signal_cooldown_hours: float = float(
+            self.config.get("execution", {}).get(
+                "signal_cooldown_hours", 4,
+            )
+        )
+        self._prune_alerted_after_hours: float = float(
+            self.config.get("execution", {}).get(
+                "prune_alerted_after_hours", 24,
+            )
+        )
 
         self.db = Database(self.config["database"])
         self.journal = SignalJournal(self.db)
@@ -192,7 +202,82 @@ class QuantBotV9:
                     os.unlink(chart_path)
                 except Exception:
                     pass
+    def _should_skip_symbol(self, symbol: str) -> Optional[str]:
+        """
+        Return a reason string if the symbol should be skipped, else None.
 
+        Guards:
+          1. Active position already open
+          2. Pending limit entry in progress
+          3. Alerted on this symbol within signal_cooldown_hours
+        """
+        # 1. Active position
+        if symbol in self.executor.active_positions:
+            return "active_position"
+
+        # 2. Pending entry
+        pending = self.executor._pending_entries.get(symbol)
+        if pending is not None and not pending.done():
+            return "pending_entry"
+
+        # 3. Cooldown window
+        if self._signal_cooldown_hours > 0:
+            entry = self._alerted_signals.get(symbol)
+            if entry is not None:
+                age_hours = (
+                    datetime.utcnow() - entry["timestamp"]
+                ).total_seconds() / 3600
+                if age_hours < self._signal_cooldown_hours:
+                    return (
+                        f"cooldown:alerted_{age_hours:.1f}h_ago"
+                        f"(limit={self._signal_cooldown_hours}h)"
+                    )
+
+        return None
+
+    def _record_alert(self, symbol: str, direction: str, confidence: float, signal_id: int):
+        """Record a successfully-alerted signal for cooldown tracking."""
+        self._alerted_signals[symbol] = {
+            "timestamp": datetime.utcnow(),
+            "direction": direction,
+            "confidence": confidence,
+            "signal_id": signal_id,
+        }
+        asyncio.create_task(self._persist_alert(
+            symbol, direction, confidence, signal_id,
+        ))
+
+    async def _persist_alert(self, symbol, direction, confidence, signal_id):
+        try:
+            await self.db.execute(
+                "INSERT INTO signal_cooldowns "
+                "(symbol, alerted_at, direction, confidence, signal_id) "
+                "VALUES ($1, NOW(), $2, $3, $4) "
+                "ON CONFLICT (symbol) DO UPDATE SET "
+                "alerted_at = NOW(), direction = EXCLUDED.direction, "
+                "confidence = EXCLUDED.confidence, signal_id = EXCLUDED.signal_id",
+                symbol, direction, confidence, signal_id,
+            )
+        except Exception as e:
+            logger.debug(f"Cooldown persist failed for {symbol}: {e}")
+
+    def _prune_alerted_signals(self):
+        """Remove cooldown entries older than prune_alerted_after_hours."""
+        if self._prune_alerted_after_hours <= 0:
+            return
+        cutoff = datetime.utcnow() - timedelta(
+            hours=self._prune_alerted_after_hours,
+        )
+        stale = [
+            s for s, info in self._alerted_signals.items()
+            if info["timestamp"] < cutoff
+        ]
+        for s in stale:
+            del self._alerted_signals[s]
+        if stale:
+            logger.debug(
+                f"Pruned {len(stale)} stale alert cooldowns"
+            )
     # ================================================================== #
     #  Lifecycle
     # ================================================================== #
@@ -204,6 +289,24 @@ class QuantBotV9:
         self._running = True
         await self.client.start()
         await self.db.connect()
+        try:
+            rows = await self.db.fetch(
+                "SELECT symbol, alerted_at, direction, confidence, signal_id "
+                "FROM signal_cooldowns "
+                "WHERE alerted_at > NOW() - INTERVAL '24 hours'"
+            )
+            for r in rows:
+                self._alerted_signals[r["symbol"]] = {
+                    "timestamp": r["alerted_at"].replace(tzinfo=None),
+                    "direction": r["direction"],
+                    "confidence": r["confidence"],
+                    "signal_id": r["signal_id"],
+                }
+            logger.info(
+                f"Loaded {len(self._alerted_signals)} signal cooldowns from DB"
+            )
+        except Exception as e:
+            logger.warning(f"Could not load signal cooldowns: {e}")
         await self.executor.start_monitor()
 
         self._daily_task = asyncio.create_task(self._daily_scheduler())
@@ -305,6 +408,9 @@ class QuantBotV9:
 
         while self._running:
             try:
+                # Prune stale cooldown entries (memory housekeeping)
+                self._prune_alerted_signals()
+
                 logger.info("Fetching full Bybit symbol list...")
                 all_symbols = await self.client.get_all_linear_symbols(
                     quote_coin="USDT",
@@ -363,6 +469,11 @@ class QuantBotV9:
     #  Per-symbol analysis pipeline
     # ================================================================== #
     async def _analyse_and_signal(self, symbol: str):
+        skip_reason = self._should_skip_symbol(symbol)
+        if skip_reason:
+            logger.debug(f"{symbol}: skipping — {skip_reason}")
+            return
+
         klines = await self.client.get_klines(
             symbol, interval="60", limit=200,
         )
@@ -636,9 +747,24 @@ class QuantBotV9:
             },
         )
 
+        skip_reason = self._should_skip_symbol(symbol)
+        if skip_reason:
+            logger.info(
+                f"{symbol}: signal blocked at execute — {skip_reason}"
+            )
+            return
+
         result = await self.executor.execute_signal(signal)
         if result["status"] != "filled":
             return
+
+        # Record for cooldown — happens only after successful fill
+        self._record_alert(
+            symbol=symbol,
+            direction=bias,
+            confidence=final.calibrated_confidence,
+            signal_id=signal_id,
+        )
 
         # ---- Notify Discord (chart + embeds) ----
         chart_path = None
