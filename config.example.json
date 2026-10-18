@@ -3,9 +3,21 @@
     "bybit_key": "YOUR_V5_API_KEY_HERE",
     "bybit_secret": "YOUR_V5_API_SECRET_HERE",
     "testnet": false,
-    "discord_webhook": "https://discord.com/api/webhooks/XXX/YYY",
-    "discord_live_webhook": "https://discord.com/api/webhooks/XXX/YYY",
-    "discord_dashboard_webhook": "https://discord.com/api/webhooks/XXX/YYY"
+    "discord_servers": [
+        {
+            "name": "Server A (combined)",
+            "mode": "combined",
+            "webhook": "https://discord.com/api/webhooks/AAA/aaa"
+        },
+        {
+            "name": "Server B (split)",
+            "mode": "split",
+            "live":      "https://discord.com/api/webhooks/BBB1/bbb1",
+            "quant":     "https://discord.com/api/webhooks/BBB2/bbb2",
+            "dashboard": "https://discord.com/api/webhooks/BBB3/bbb3",
+            "alerts":    "https://discord.com/api/webhooks/BBB3/bbb3"
+        }
+    ]
   },
 
   "deepseek": {

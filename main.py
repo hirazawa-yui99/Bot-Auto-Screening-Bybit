@@ -5,19 +5,22 @@ Bybit Quant Bot v9.1 — Async orchestrator with FULL-PAIR scanning.
 Wires together:
   - V5 client with get_all_linear_symbols() pagination
   - DerivativeAnalyzer (CVD, OI, L/S ratio)
-  - CompositeQuantEngine (Zeta, basis, volume anomaly)
+  - CompositeQuantEngine (Zeta, basis, volume anomaly, funding)
   - ConfidenceScorer (calibrated, high-confidence gate)
   - DeepSeekAgent (LLM analysis)
-  - TradeExecutor (WS orders + position monitor)
+  - TradeExecutor (WS orders + position monitor + close callback)
   - AutoTuner + OutcomeTracker (07:00 daily improvement)
-  - Discord notifications
+  - Discord notifications + chart generation
 """
+import os
 import asyncio
 import json
 import logging
+import math
 import signal
 import sys
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,9 +36,9 @@ from learning.signal_journal import SignalJournal
 from learning.outcome_tracker import OutcomeTracker
 from learning.auto_tuner import AutoTuner
 from notification.discord_bot import DiscordNotifier
+from notification.chart_generator import ChartGenerator
 from persistence.database import Database
-from typing import Dict, List, Optional, Tuple
-import math 
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +56,7 @@ class QuantBotV9:
         with open(config_path) as f:
             self.config = json.load(f)
 
+        # ---- Core clients ----
         self.client = BybitV5Client(BybitConfig(
             api_key=self.config["api"]["bybit_key"],
             api_secret=self.config["api"]["bybit_secret"],
@@ -63,35 +67,135 @@ class QuantBotV9:
         self.db = Database(self.config["database"])
         self.journal = SignalJournal(self.db)
 
+        # ---- Analysis ----
         self.derivatives = DerivativeAnalyzer(self.client)
         self.scorer = ConfidenceScorer(
             min_raw_threshold=self.config["strategy"]["min_raw_threshold"],
             min_calibrated=self.config["strategy"]["min_calibrated"],
         )
         self.composite_engine = CompositeQuantEngine(
-        self.client,
-        weights=self.config.get("strategy", {}).get("composite_weights"),
-        funding_config=self.config.get("funding"),
+            self.client,
+            weights=self.config.get("strategy", {}).get("composite_weights"),
+            funding_config=self.config.get("funding"),
         )
 
+        # ---- LLM ----
         self.agent = DeepSeekAgent(DeepSeekConfig(
             api_key=self.config["deepseek"]["api_key"],
-            model=self.config["deepseek"].get("model", "deepseek-chat"),
+            base_url=self.config["deepseek"].get(
+                "base_url", "https://api.deepseek.com/v1",
+            ),
+            model=self.config["deepseek"].get(
+                "model", "deepseek-v4-pro",
+            ),
+            model_high_confidence=self.config["deepseek"].get(
+                "model_high_confidence", "deepseek-v4-pro",
+            ),
+            temperature=self.config["deepseek"].get("temperature", 0.3),
+            max_tokens=self.config["deepseek"].get("max_tokens", 1500),
+            timeout=self.config["deepseek"].get("timeout", 45),
+            error_cooldown_sec=self.config["deepseek"].get(
+                "error_cooldown_sec", 900,
+            ),
         ))
 
+        # ---- Risk + execution ----
         self.risk_manager = RiskManager(self.config["risk"])
         self.executor = TradeExecutor(
-            self.client, self.risk_manager, self.config["execution"],
+            self.client,
+            self.risk_manager,
+            self.config["execution"],
+            on_position_closed=self._on_position_closed,
         )
 
+        # ---- Learning ----
         self.outcome_tracker = OutcomeTracker(self.client, self.journal)
         self.auto_tuner = AutoTuner(self.config["auto_tune"], self.scorer)
+
+        # ---- Notification ----
         self.notifier = DiscordNotifier(self.config["api"])
+        self.chart_generator = ChartGenerator()
 
+        # ---- Runtime ----
         self._running = False
-        self._daily_task = None
-        self._scan_task = None
+        self._daily_task: Optional[asyncio.Task] = None
+        self._scan_task: Optional[asyncio.Task] = None
 
+    # ================================================================== #
+    #  Position-close callback (called by TradeExecutor)
+    # ================================================================== #
+    async def _on_position_closed(
+        self, symbol, pos, pnl_pct, filled_tps, exit_reason,
+    ):
+        """Called by executor when a position closes — sends Discord alert."""
+        chart_path = None
+        try:
+            klines = await self.client.get_klines(
+                symbol, interval="60", limit=80,
+            )
+            if klines and len(klines) >= 20:
+                df = pd.DataFrame(
+                    klines,
+                    columns=["ts", "open", "high", "low", "close",
+                             "volume", "turnover"],
+                )
+                for col in ("open", "high", "low", "close", "volume"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.sort_values("ts").reset_index(drop=True)
+
+                chart_path = await self.chart_generator.render_signal_chart(
+                    df=df,
+                    context={
+                        "symbol": symbol,
+                        "price": float(df["close"].iloc[-1]),
+                        "signal_info": {
+                            "entry": pos.entry_price,
+                            "sl": pos.initial_stop_loss,
+                            "tps": pos.tps,
+                            "direction": (
+                                "long" if pos.side == "Buy" else "short"
+                            ),
+                        },
+                        "composite": None,
+                        "breakdown": None,
+                        "deriv": None,
+                        "indicators": {},
+                    },
+                )
+        except Exception as e:
+            logger.debug(f"Chart for closed position failed: {e}")
+
+        pnl_usd = (
+            pos.unrealized_pnl
+            if pos.unrealized_pnl != 0
+            else pos.entry_price * pos.total_qty * pnl_pct / 100
+        )
+
+        try:
+            await self.notifier.send_position_closed(
+                symbol=symbol,
+                side="buy" if pos.side == "Buy" else "sell",
+                entry=pos.entry_price,
+                exit_price=pos.entry_price * (1 + pnl_pct / 100),
+                pnl_pct=pnl_pct,
+                pnl_usd=pnl_usd,
+                filled_tps=filled_tps,
+                total_tps=len(pos.tps),
+                exit_reason=exit_reason,
+                chart_path=chart_path,
+            )
+        except Exception as e:
+            logger.error(f"Discord close alert failed: {e}")
+        finally:
+            if chart_path:
+                try:
+                    os.unlink(chart_path)
+                except Exception:
+                    pass
+
+    # ================================================================== #
+    #  Lifecycle
+    # ================================================================== #
     async def start(self):
         logger.info("=" * 60)
         logger.info("Bybit Quant Bot v9.1 starting — FULL-PAIR SCANNER")
@@ -112,13 +216,40 @@ class QuantBotV9:
 
         logger.info("All subsystems started.")
         try:
-            await asyncio.gather(self._daily_task, self._scan_task)
+            await asyncio.gather(
+                self._daily_task, self._scan_task,
+                return_exceptions=True,
+            )
         except asyncio.CancelledError:
             pass
 
     async def stop(self):
         logger.info("Shutting down...")
         self._running = False
+
+        # 1. Cancel background tasks FIRST so they stop touching the DB
+        tasks_to_cancel = []
+        for attr in ("_scan_task", "_daily_task"):
+            task = getattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                tasks_to_cancel.append(task)
+
+        # 2. Wait for them to exit (max 15s)
+        if tasks_to_cancel:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=15,
+                )
+                logger.info("Background tasks exited cleanly")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Background tasks did not exit within 15s — "
+                    "continuing shutdown"
+                )
+
+        # 3. Close resources in order
         await self.executor.stop_monitor()
         await self.executor.close_all_positions()
         await self.client.stop()
@@ -126,28 +257,22 @@ class QuantBotV9:
         await self.db.close()
         logger.info("Shutdown complete.")
 
+    # ================================================================== #
+    #  TP/SL computation
+    # ================================================================== #
     def _compute_tp_levels(
         self, entry: float, atr: float, direction: str,
     ) -> Tuple[float, float, float, float]:
         """
-        Compute SL and TP1/TP2/TP3 levels.
-
-        Returns: (sl, tp1, tp2, tp3)
-
-        Modes:
-          - "r_multiple" (default): SL = entry - atr_mult * ATR (defines 1R)
-                                    TP1 = entry + 1R, TP2 = entry + 2R, TP3 = entry + 3R
-          - "atr":  SL = entry - sl_mult*ATR
-                    TP1/TP2/TP3 = entry ± tp_mults[i]*ATR
+        Compute SL and TP1/TP2/TP3 levels. Returns (sl, tp1, tp2, tp3).
         """
         cfg = self.config["execution"]
         mode = cfg.get("tp_mode", "r_multiple")
         sl_mult = cfg.get("atr_multiplier_sl", 1.5)
         r_mults = cfg.get("tp_r_multiples", [1.0, 2.0, 3.0])
 
-        # Guard against zero/negative ATR
         if atr <= 0 or not math.isfinite(atr):
-            atr = entry * 0.01  # fallback to 1%
+            atr = entry * 0.01
 
         if direction == "long":
             sl = entry - sl_mult * atr
@@ -155,7 +280,7 @@ class QuantBotV9:
             if mode == "atr":
                 tp_mults = cfg.get("tp_atr_multiples", [1.5, 2.5, 4.0])
                 tps = [entry + m * atr for m in tp_mults]
-            else:  # r_multiple
+            else:
                 tps = [entry + risk * r for r in r_mults]
         else:
             sl = entry + sl_mult * atr
@@ -169,17 +294,9 @@ class QuantBotV9:
         return sl, tps[0], tps[1], tps[2]
 
     # ================================================================== #
-    #  FULL-PAIR SCAN LOOP
+    #  Full-pair scan loop
     # ================================================================== #
     async def _scan_loop(self):
-        """
-        Scans ALL Bybit USDT perpetual pairs.
-
-        Each cycle:
-          1. Fetch every active LinearPerpetual symbol via pagination.
-          2. Filter by 24h turnover (default >5M USDT).
-          3. Analyse each symbol concurrently (bounded by semaphore).
-        """
         interval = self.config["system"].get("check_interval_hours", 1)
         scan_top_n = self.config["system"].get("scan_top_n", 0)
         min_turnover = self.config["system"].get(
@@ -195,10 +312,10 @@ class QuantBotV9:
                     min_turnover_24h=min_turnover,
                 )
 
-                if scan_top_n > 0:
-                    symbols = all_symbols[:scan_top_n]
-                else:
-                    symbols = all_symbols
+                symbols = (
+                    all_symbols[:scan_top_n] if scan_top_n > 0
+                    else all_symbols
+                )
 
                 logger.info(
                     f"Scanning {len(symbols)} symbols "
@@ -206,17 +323,18 @@ class QuantBotV9:
                 )
 
                 semaphore = asyncio.Semaphore(
-                    self.config["system"].get("max_concurrent", 10)
+                    self.config["system"].get("max_concurrent", 3)
                 )
 
                 async def analyse_symbol(sym):
                     async with semaphore:
+                        if not self._running:
+                            return
                         try:
                             await self._analyse_and_signal(sym)
                         except Exception as e:
                             logger.error(
                                 f"Analysis failed for {sym}: {e}",
-                                exc_info=False,
                             )
 
                 await asyncio.gather(
@@ -224,16 +342,27 @@ class QuantBotV9:
                 )
                 logger.info(f"Scan complete. Next in {interval}h.")
 
+            except asyncio.CancelledError:
+                logger.info("Scan loop cancelled")
+                return
             except Exception as e:
                 logger.error(f"Scan loop error: {e}", exc_info=True)
 
-            await asyncio.sleep(interval * 3600)
+            # Interruptible sleep — checks _running every 5s
+            remaining = interval * 3600
+            while remaining > 0 and self._running:
+                chunk = min(5.0, remaining)
+                await asyncio.sleep(chunk)
+                remaining -= chunk
+
+            if not self._running:
+                logger.info("Scan loop exiting (shutdown signaled)")
+                return
 
     # ================================================================== #
     #  Per-symbol analysis pipeline
     # ================================================================== #
     async def _analyse_and_signal(self, symbol: str):
-        """Full analysis pipeline for a single symbol."""
         klines = await self.client.get_klines(
             symbol, interval="60", limit=200,
         )
@@ -242,17 +371,16 @@ class QuantBotV9:
 
         df = pd.DataFrame(
             klines,
-            columns=["ts", "open", "high", "low", "close", "volume", "turnover"],
+            columns=["ts", "open", "high", "low", "close",
+                     "volume", "turnover"],
         )
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.sort_values("ts").reset_index(drop=True)
 
         indicators = self._compute_indicators(df)
-
         deriv = await self.derivatives.get_full_snapshot(symbol)
 
-        # Composite quant engine (Zeta, basis, volume)
         composite = await self.composite_engine.compute(
             symbol=symbol,
             df=df,
@@ -261,9 +389,14 @@ class QuantBotV9:
             bar_interval_hours=1.0,
         )
 
-        bias = composite.direction if composite.direction != "neutral" else (
-            "long" if indicators.get("ema_9", 0) > indicators.get("ema_21", 0)
-            else "short"
+        bias = (
+            composite.direction
+            if composite.direction != "neutral"
+            else (
+                "long"
+                if indicators.get("ema_9", 0) > indicators.get("ema_21", 0)
+                else "short"
+            )
         )
 
         patterns = self._detect_patterns(df)
@@ -278,8 +411,9 @@ class QuantBotV9:
             llm_response=None,
             composite=composite,
             funding_result=composite.funding,
-
         )
+
+        # ---- Prelim gate: log rejects so auto-tuner has data ----
         if prelim.raw_total < 40:
             await self.journal.log_signal({
                 "symbol": symbol,
@@ -299,15 +433,16 @@ class QuantBotV9:
                 "hurst": composite.mean_reversion.hurst,
                 "half_life_hours": composite.mean_reversion.half_life_hours,
                 "basis_pct": composite.basis.basis_pct,
-                "funding_annualized_pct": composite.basis.funding_annualized,
+                "funding_annualized_pct": (
+                    composite.funding.annualized_pct
+                ),
                 "volume_zscore": composite.volume.z_score,
                 "volume_anomaly_level": composite.volume.anomaly_level,
                 "funding_rate_pct": composite.funding.rate_pct,
-                "funding_annualized_pct": composite.funding.annualized_pct,
                 "funding_regime": composite.funding.regime,
-                "funding_contrarian_bias": composite.funding.contrarian_bias,
-                "funding_block_long": composite.funding.should_block_long,
-                "funding_block_short": composite.funding.should_block_short,
+                "funding_contrarian_bias": (
+                    composite.funding.contrarian_bias
+                ),
                 "_breakdown": {
                     "technical_score": prelim.technical_score,
                     "composite_score": prelim.composite_score,
@@ -319,6 +454,7 @@ class QuantBotV9:
             })
             return
 
+        # ---- DeepSeek analysis ----
         market_context = {
             "symbol": symbol,
             "price": float(df["close"].iloc[-1]),
@@ -348,16 +484,22 @@ class QuantBotV9:
                     "zeta": composite.mean_reversion.zeta,
                     "z_score": composite.mean_reversion.z_score,
                     "phi": composite.mean_reversion.phi,
-                    "half_life_hours": composite.mean_reversion.half_life_hours,
+                    "half_life_hours": (
+                        composite.mean_reversion.half_life_hours
+                    ),
                     "hurst": composite.mean_reversion.hurst,
                     "regime": composite.mean_reversion.regime,
                     "adf_pvalue": composite.mean_reversion.adf_pvalue,
-                    "is_stationary": composite.mean_reversion.is_stationary,
+                    "is_stationary": (
+                        composite.mean_reversion.is_stationary
+                    ),
                 },
                 "basis": {
                     "basis_pct": composite.basis.basis_pct,
                     "funding_rate": composite.basis.funding_rate,
-                    "funding_annualized_pct": composite.basis.funding_annualized,
+                    "funding_annualized_pct": (
+                        composite.basis.funding_annualized
+                    ),
                     "regime": composite.basis.regime,
                     "signal_bias": composite.basis.signal_bias,
                 },
@@ -368,6 +510,19 @@ class QuantBotV9:
                     "anomaly_level": composite.volume.anomaly_level,
                     "vwpd": composite.volume.vwpd,
                     "divergence": composite.volume.divergence,
+                },
+                "funding": {
+                    "rate_pct": composite.funding.rate_pct,
+                    "annualized_pct": composite.funding.annualized_pct,
+                    "regime": composite.funding.regime,
+                    "contrarian_bias": composite.funding.contrarian_bias,
+                    "bias_strength": composite.funding.bias_strength,
+                    "should_block_long": (
+                        composite.funding.should_block_long
+                    ),
+                    "should_block_short": (
+                        composite.funding.should_block_short
+                    ),
                 },
             },
             "patterns": patterns,
@@ -385,7 +540,7 @@ class QuantBotV9:
             bias=bias,
             llm_response=llm_response,
             composite=composite,
-            funding_result=composite.funding,   # NEW
+            funding_result=composite.funding,
         )
 
         signal_id = await self.journal.log_signal({
@@ -406,9 +561,14 @@ class QuantBotV9:
             "hurst": composite.mean_reversion.hurst,
             "half_life_hours": composite.mean_reversion.half_life_hours,
             "basis_pct": composite.basis.basis_pct,
-            "funding_annualized_pct": composite.basis.funding_annualized,
+            "funding_annualized_pct": composite.funding.annualized_pct,
             "volume_zscore": composite.volume.z_score,
             "volume_anomaly_level": composite.volume.anomaly_level,
+            "funding_rate_pct": composite.funding.rate_pct,
+            "funding_regime": composite.funding.regime,
+            "funding_contrarian_bias": (
+                composite.funding.contrarian_bias
+            ),
             "_breakdown": {
                 "technical_score": final.technical_score,
                 "composite_score": final.composite_score,
@@ -423,18 +583,14 @@ class QuantBotV9:
             logger.debug(
                 f"{symbol}: not high confidence "
                 f"(raw={final.raw_total:.1f}, "
-                f"cal={final.calibrated_confidence:.2f})"
+                f"cal={final.calibrated_confidence:.2f}, "
+                f"gates={final.gate_reasons})"
             )
             return
 
+        # ---- Build trade signal ----
         entry = float(df["close"].iloc[-1])
         atr = indicators.get("atr", entry * 0.01)
-        if bias == "long":
-            sl = entry - 1.5 * atr
-            tp1 = entry + 3.0 * atr
-        else:
-            sl = entry + 1.5 * atr
-            tp1 = entry - 3.0 * atr
 
         sl, tp1, tp2, tp3 = self._compute_tp_levels(
             entry=entry,
@@ -463,25 +619,73 @@ class QuantBotV9:
             metadata={
                 "signal_id": signal_id,
                 "llm": llm_response,
-                # --- NEW: funding flags for risk manager ---
                 "funding_rate_pct": composite.funding.rate_pct,
-                "funding_annualized_pct": composite.funding.annualized_pct,
+                "funding_annualized_pct": (
+                    composite.funding.annualized_pct
+                ),
                 "funding_regime": composite.funding.regime,
-                "funding_contrarian_bias": composite.funding.contrarian_bias,
-                "funding_block_long": composite.funding.should_block_long,
-                "funding_block_short": composite.funding.should_block_short,
+                "funding_contrarian_bias": (
+                    composite.funding.contrarian_bias
+                ),
+                "funding_block_long": (
+                    composite.funding.should_block_long
+                ),
+                "funding_block_short": (
+                    composite.funding.should_block_short
+                ),
             },
         )
 
         result = await self.executor.execute_signal(signal)
-        if result["status"] == "filled":
-            await self.notifier.send_signal_alert(
-                signal, final, llm_response,
+        if result["status"] != "filled":
+            return
+
+        # ---- Notify Discord (chart + embeds) ----
+        chart_path = None
+        try:
+            chart_path = await self.chart_generator.render_signal_chart(
+                df=df,
+                context={
+                    "symbol": symbol,
+                    "price": entry,
+                    "signal_info": {
+                        "entry": entry,
+                        "sl": signal.stop_loss,
+                        "tps": signal.tp_list,
+                        "direction": signal.direction,
+                    },
+                    "composite": composite,
+                    "breakdown": final,
+                    "deriv": deriv,
+                    "indicators": indicators,
+                },
             )
-            await self.journal.mark_executed(signal_id, result)
+        except Exception as e:
+            logger.error(f"Chart failed for {symbol}: {e}")
+
+        try:
+            await self.notifier.send_signal_alert(
+                signal=signal,
+                breakdown=final,
+                llm_response=llm_response,
+                chart_path=chart_path,
+                composite=composite,
+                deriv=deriv,
+                indicators=indicators,
+            )
+        except Exception as e:
+            logger.error(f"Discord alerts failed for {symbol}: {e}")
+        finally:
+            if chart_path:
+                try:
+                    os.unlink(chart_path)
+                except Exception:
+                    pass
+
+        await self.journal.mark_executed(signal_id, result)
 
     # ================================================================== #
-    #  Indicator helpers
+    #  Indicators & patterns
     # ================================================================== #
     def _compute_indicators(self, df) -> dict:
         close = df["close"]
@@ -522,7 +726,10 @@ class QuantBotV9:
                 if recent[i] < recent[i - 1] and recent[i] < recent[i + 1]
             ]
             if len(lows) >= 2:
-                if abs(recent[lows[-1]] - recent[lows[-2]]) / recent[lows[-2]] < 0.02:
+                if (
+                    abs(recent[lows[-1]] - recent[lows[-2]])
+                    / recent[lows[-2]] < 0.02
+                ):
                     patterns.append("double_bottom")
         return patterns
 
@@ -542,7 +749,18 @@ class QuantBotV9:
             logger.info(
                 f"Next auto-improvement in {wait_seconds/3600:.1f}h"
             )
-            await asyncio.sleep(wait_seconds)
+
+            # Interruptible sleep — checks _running every 30s
+            remaining = wait_seconds
+            while remaining > 0 and self._running:
+                chunk = min(30.0, remaining)
+                await asyncio.sleep(chunk)
+                remaining -= chunk
+
+            if not self._running:
+                logger.info("Daily scheduler exiting (shutdown signaled)")
+                return
+
             try:
                 logger.info("DAILY AUTO-IMPROVEMENT STARTING")
                 await self.outcome_tracker.run_daily_check()
@@ -555,6 +773,9 @@ class QuantBotV9:
                     f"Auto-improvement complete. "
                     f"{len(results)} adjustments applied."
                 )
+            except asyncio.CancelledError:
+                logger.info("Daily scheduler cancelled")
+                return
             except Exception as e:
                 logger.error(
                     f"Daily improvement failed: {e}", exc_info=True,
@@ -590,6 +811,12 @@ async def main():
         await bot.start()
     except KeyboardInterrupt:
         await bot.stop()
+    finally:
+        # Ensure DB is closed even on unexpected start() crash
+        try:
+            await bot.db.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

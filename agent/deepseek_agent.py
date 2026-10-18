@@ -1,9 +1,13 @@
 """
 agent/deepseek_agent.py
 DeepSeek LLM integration for agentic trading analysis.
+
+Configured for deepseek-v4-pro by default. Pro has stronger agentic
+reasoning and multi-step tool use than Flash, at ~4-5x the cost.
 """
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -16,23 +20,24 @@ DEEPSEEK_SYSTEM_PROMPT = """You are a senior quantitative trading analyst at a c
 You specialise in Bybit perpetual futures. You receive structured market data
 including: price action, technical indicators, CVD, Open Interest, funding rates,
 account long/short ratios, top-trader long/short ratios, mean-reversion metrics
-(Zeta, Hurst, half-life, ADF p-value), basis spread, and volume anomaly data.
+(Zeta, Hurst, half-life, ADF p-value), basis spread, volume anomaly data, and
+funding regime classification.
 
 Your job:
-1. Assess whether the quantitative model's directional bias is supported.
+1. Assess whether the quantitative model's directional bias is supported by the data.
 2. Identify specific invalidation conditions (price levels or metric thresholds).
 3. Flag conflicting signals across timeframes.
 4. Do NOT invent data. If a metric is missing, say so.
 5. Do NOT output a confidence percentage.
 
-Return ONLY a JSON object:
+Return ONLY a JSON object with these exact fields:
 {
   "direction": "long" | "short" | "neutral",
   "agrees_with_quant": true | false,
-  "key_reasons": ["..."],
-  "invalidation_conditions": ["..."],
-  "risk_notes": ["..."],
-  "conflicting_signals": ["..."]
+  "key_reasons": ["...", "..."],
+  "invalidation_conditions": ["...", "..."],
+  "risk_notes": ["...", "..."],
+  "conflicting_signals": ["...", "..."]
 }
 """
 
@@ -41,17 +46,33 @@ Return ONLY a JSON object:
 class DeepSeekConfig:
     api_key: str
     base_url: str = "https://api.deepseek.com/v1"
-    model: str = "deepseek-flash"
-    model_high_confidence: str = "deepseek-v4-pro"  # for raw >= 55
+    model: str = "deepseek-v4-pro"
+    model_high_confidence: str = "deepseek-v4-pro"
     temperature: float = 0.3
     max_tokens: int = 1500
-    timeout: int = 30
+    timeout: int = 45
+    error_cooldown_sec: int = 900
 
 
 class DeepSeekAgent:
+    """
+    Agentic LLM layer for trading analysis.
+
+    Uses deepseek-v4-pro for all analysis. Disables itself for
+    error_cooldown_sec after a fatal API error (balance, auth) so
+    the scan loop doesn't hammer the API.
+    """
+
     def __init__(self, cfg: DeepSeekConfig):
         self.cfg = cfg
         self._session: Optional[aiohttp.ClientSession] = None
+        self._disabled_until: float = 0.0
+        self._last_error: str = ""
+        logger.info(
+            f"DeepSeekAgent initialised: "
+            f"model={self.cfg.model} "
+            f"model_high_confidence={self.cfg.model_high_confidence}"
+        )
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -66,7 +87,7 @@ class DeepSeekAgent:
                 "type": "function",
                 "function": {
                     "name": "get_klines",
-                    "description": "Fetch OHLCV kline data",
+                    "description": "Fetch OHLCV kline data for a symbol",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -82,7 +103,7 @@ class DeepSeekAgent:
                 "type": "function",
                 "function": {
                     "name": "get_orderbook",
-                    "description": "Fetch orderbook depth",
+                    "description": "Fetch current orderbook depth for a symbol",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -93,7 +114,56 @@ class DeepSeekAgent:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_derivative_snapshot",
+                    "description": "Fetch CVD, OI, funding, and L/S ratio data",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                        },
+                        "required": ["symbol"],
+                    },
+                },
+            },
         ]
+
+    def _select_model(self, prelim_score: float):
+        """
+        Returns (model_name, reasoning_effort).
+
+        With both fields set to deepseek-v4-pro, always returns Pro.
+        Reasoning effort scales with prelim_score to save tokens on
+        weak signals.
+        """
+        if prelim_score >= 55:
+            return self.cfg.model_high_confidence, "high"
+        # Below 55: still Pro, but low reasoning effort to save output tokens
+        return self.cfg.model, "low"
+
+    def _is_disabled(self) -> bool:
+        return time.time() < self._disabled_until
+
+    def _disable(self, reason: str):
+        self._disabled_until = time.time() + self.cfg.error_cooldown_sec
+        self._last_error = reason
+        logger.warning(
+            f"DeepSeek agent disabled for "
+            f"{self.cfg.error_cooldown_sec}s — reason: {reason}"
+        )
+
+    def _neutral_response(self, reason: str = "disabled") -> Dict:
+        return {
+            "direction": "neutral",
+            "agrees_with_quant": False,
+            "key_reasons": [],
+            "invalidation_conditions": [],
+            "risk_notes": [f"LLM unavailable: {reason}"],
+            "conflicting_signals": [],
+            "_llm_unavailable": True,
+        }
 
     async def analyse(
         self,
@@ -101,13 +171,17 @@ class DeepSeekAgent:
         market_context: Dict,
         tool_executor: Optional[Any] = None,
     ) -> Dict:
+        # Short-circuit if disabled
+        if self._is_disabled():
+            remaining = int(self._disabled_until - time.time())
+            logger.debug(
+                f"DeepSeek disabled for {remaining}s — "
+                f"returning neutral for {symbol}"
+            )
+            return self._neutral_response("cooldown")
+
         prelim_score = market_context.get("preliminary_score", 0)
-        if prelim_score >= 55:
-            model = self.cfg.model_high_confidence      # "deepseek-v4-pro"
-            reasoning_effort = "high"
-        else:
-            model = self.cfg.model                       # "deepseek-flash"
-            reasoning_effort = "low"
+        model, reasoning_effort = self._select_model(prelim_score)
 
         messages = [
             {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
@@ -117,21 +191,26 @@ class DeepSeekAgent:
                     f"Analyse {symbol}.\n\n"
                     f"Market context:\n"
                     f"{json.dumps(market_context, indent=2, default=str)}\n\n"
-                    f"Respond in JSON."
+                    f"Respond ONLY in the required JSON format."
                 ),
             },
         ]
+
         tools = self._build_tools()
         session = await self._get_session()
 
         for _ in range(5):
             payload = {
-                "model": self.cfg.model,
+                "model": model,
                 "messages": messages,
                 "tools": tools,
                 "temperature": self.cfg.temperature,
                 "max_tokens": self.cfg.max_tokens,
             }
+            # Pro supports reasoning_effort
+            if "pro" in model.lower():
+                payload["reasoning_effort"] = reasoning_effort
+
             try:
                 async with session.post(
                     f"{self.cfg.base_url}/chat/completions",
@@ -144,12 +223,35 @@ class DeepSeekAgent:
                     data = await resp.json()
             except Exception as e:
                 logger.error(f"DeepSeek request failed: {e}")
-                return {"direction": "neutral", "agrees_with_quant": False,
-                        "error": str(e)}
+                self._disable(f"request error: {e}")
+                return self._neutral_response(str(e))
 
+            # Handle API errors
             if "error" in data:
+                err_msg = data["error"].get("message", "")
                 logger.error(f"DeepSeek API error: {data['error']}")
-                return {"direction": "neutral", "agrees_with_quant": False}
+
+                low = err_msg.lower()
+                if any(kw in low for kw in (
+                    "insufficient balance",
+                    "insufficient_balance",
+                    "authentication",
+                    "unauthorized",
+                    "invalid api key",
+                    "quota",
+                )):
+                    self._disable(err_msg)
+                    return self._neutral_response(err_msg)
+
+                # Retry once at low effort on Pro failure
+                if reasoning_effort != "low":
+                    logger.warning(
+                        "Retrying at low reasoning_effort"
+                    )
+                    reasoning_effort = "low"
+                    continue
+
+                return self._neutral_response(err_msg)
 
             choice = data["choices"][0]
             msg = choice["message"]
@@ -159,13 +261,18 @@ class DeepSeekAgent:
                 for tc in msg["tool_calls"]:
                     fn_name = tc["function"]["name"]
                     fn_args = json.loads(tc["function"]["arguments"])
+                    logger.info(
+                        f"DeepSeek requested tool: {fn_name}({fn_args})"
+                    )
+
                     if tool_executor:
                         try:
                             result = await tool_executor(fn_name, fn_args)
                         except Exception as e:
                             result = {"error": str(e)}
                     else:
-                        result = {"error": "no tool_executor"}
+                        result = {"error": "no tool_executor provided"}
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -181,15 +288,14 @@ class DeepSeekAgent:
                     content = content.split("```")[1].split("```")[0]
                 parsed = json.loads(content.strip())
             except json.JSONDecodeError:
-                parsed = {
-                    "direction": "neutral",
-                    "agrees_with_quant": False,
-                    "raw_response": content[:500],
-                }
+                logger.warning(
+                    f"DeepSeek returned non-JSON: {content[:200]}"
+                )
+                parsed = self._neutral_response("non-json response")
+
             return parsed
 
-        return {"direction": "neutral", "agrees_with_quant": False,
-                "error": "max_tool_rounds_exceeded"}
+        return self._neutral_response("max_tool_rounds_exceeded")
 
     async def close(self):
         if self._session and not self._session.closed:
