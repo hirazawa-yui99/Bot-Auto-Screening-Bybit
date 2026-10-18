@@ -130,6 +130,17 @@ class QuantBotV9:
         self._running = False
         self._daily_task: Optional[asyncio.Task] = None
         self._scan_task: Optional[asyncio.Task] = None
+        self._alerted_signals: Dict[str, Dict] = {}
+        self._signal_cooldown_hours: float = float(
+            self.config.get("execution", {}).get(
+                "signal_cooldown_hours", 4,
+            )
+        )
+        self._prune_alerted_after_hours: float = float(
+            self.config.get("execution", {}).get(
+                "prune_alerted_after_hours", 24,
+            )
+        )
 
     # ================================================================== #
     #  Position-close callback (called by TradeExecutor)
