@@ -96,13 +96,18 @@ class ActivePosition:
     lowest_price: float = 0.0
     sl_moved_to_be: bool = False
     sl_moved_to_tp1: bool = False
+    exit_reason: Optional[str] = None      # ← NEW
+
 
 
 class TradeExecutor:
-    def __init__(self, client, risk_manager, config: Dict):
+    def __init__(self, client, risk_manager, config: Dict,
+        on_position_closed=None,
+    ):
         self.client = client
         self.risk_manager = risk_manager
         self.config = config
+        self.on_position_closed = on_position_closed
         self.active_positions: Dict[str, ActivePosition] = {}
         self._pending_entries: Dict[str, asyncio.Task] = {}
         self._monitor_task: Optional[asyncio.Task] = None
@@ -852,9 +857,8 @@ class TradeExecutor:
                             - datetime.fromisoformat(pos.opened_at)
                         ).total_seconds() / 3600
                         if held > self.max_hold_hours:
-                            logger.warning(
-                                f"Max hold exceeded for {sym}"
-                            )
+                            logger.warning(f"Max hold exceeded for {sym}")
+                            pos.exit_reason = "max_hold"
                             await self._emergency_close(pos)
 
             except Exception as e:
@@ -942,34 +946,42 @@ class TradeExecutor:
             if pos.entry_price * pos.total_qty > 0 else 0.0
         )
         filled_tps = [tp for tp, f in pos.tp_filled.items() if f]
+        total_tps = len(pos.tps)
+
+        # Determine exit reason
+        if pos.exit_reason:
+            exit_reason = pos.exit_reason
+        elif len(filled_tps) == total_tps and total_tps > 0:
+            exit_reason = "tp_all"
+        elif pnl_pct < 0:
+            exit_reason = "sl_hit"
+        else:
+            exit_reason = "manual"
+
         logger.info(
             f"POSITION CLOSED: {symbol} "
             f"PnL={pos.unrealized_pnl:.2f} ({pnl_pct:.2f}%) "
-            f"TPs hit: {len(filled_tps)}/{len(pos.tps)}"
+            f"TPs hit: {len(filled_tps)}/{total_tps} "
+            f"reason={exit_reason}"
         )
         self.risk_manager.register_position_close(pnl_pct)
 
-        for tp_price, order_id in pos.tp_order_ids.items():
-            if not pos.tp_filled.get(tp_price):
-                try:
-                    await self.client.cancel_order_ws(
-                        symbol=symbol, order_id=order_id,
-                    )
-                    logger.info(
-                        f"Canceled unfilled TP order "
-                        f"{order_id[:10]} for {symbol}"
-                    )
-                except Exception as e:
-                    logger.debug(f"TP cancel failed {order_id}: {e}")
-
-        del self.active_positions[symbol]
+        # Notify via callback (main.py handles Discord)
+        if self.on_position_closed:
+            try:
+                await self.on_position_closed(
+                    symbol=symbol, pos=pos, pnl_pct=pnl_pct,
+                    filled_tps=filled_tps, exit_reason=exit_reason,
+                )
+            except Exception as e:
+                logger.error(f"Position closed callback error: {e}")
 
     async def _emergency_close(self, pos: ActivePosition):
         try:
+            if pos.exit_reason is None:
+                pos.exit_reason = "emergency_sl"
             await self.client.close_position_market(
-                symbol=pos.symbol,
-                side=pos.side,
-                qty=pos.remaining_qty,
+                symbol=pos.symbol, side=pos.side, qty=pos.remaining_qty,
             )
             logger.info(f"Emergency close {pos.symbol}")
         except Exception as e:
