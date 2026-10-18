@@ -1,20 +1,25 @@
 """
 execution/trade_executor.py
 WebSocket order placement with dual-path entry (market vs limit),
-multi-target TP, SL management, and rally-cancel for pending limits.
+multi-target TP, SL management, rally cancel, and position-close callback.
 
 Entry routing:
   - deviation = |current - entry| / entry * 100
   - deviation > max_deviation_pct       → skip (stale)
-  - rally_pct > cancel_on_rally_pct      → skip (already rallied too far)
-  - deviation <= market_tolerance_pct    → market order
-  - else                                 → limit at entry, poll for fill
+  - rally_pct > cancel_on_rally_pct     → skip (missed move)
+  - deviation <= market_tolerance_pct   → market order
+  - else                                → limit at entry, poll for fill
 
-During limit pending:
-  - Order fills                      → register position, place TP2/TP3
-  - Price rallies past cancel_pct    → cancel order (missed the move)
-  - Price hits limit                 → normal fill
-  - Expiry reached                   → cancel order
+Multi-TP:
+  - Entry order attaches SL only (tpslMode="Full")
+  - TP1, TP2, TP3 placed as separate reduce-only limit orders
+  - Sizing: filled_qty × tp_weights[i]
+
+Position close:
+  - Deletes from active_positions FIRST so the monitor cannot
+    re-detect the same close while slow async work runs
+  - Then calls on_position_closed callback (Discord + chart)
+  - Then cancels unfilled TP orders
 """
 import asyncio
 import logging
@@ -29,7 +34,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TradeSignal:
     symbol: str
-    direction: str
+    direction: str              # "long" | "short"
     entry_price: float
     stop_loss: float
     take_profit_1: float
@@ -50,7 +55,9 @@ class TradeSignal:
     def tp_list(self) -> List[float]:
         return [
             tp for tp in (
-                self.take_profit_1, self.take_profit_2, self.take_profit_3,
+                self.take_profit_1,
+                self.take_profit_2,
+                self.take_profit_3,
             ) if tp is not None
         ]
 
@@ -96,38 +103,70 @@ class ActivePosition:
     lowest_price: float = 0.0
     sl_moved_to_be: bool = False
     sl_moved_to_tp1: bool = False
-    exit_reason: Optional[str] = None      # ← NEW
-
+    exit_reason: Optional[str] = None
 
 
 class TradeExecutor:
-    def __init__(self, client, risk_manager, config: Dict,
+    def __init__(
+        self,
+        client,
+        risk_manager,
+        config: Dict,
         on_position_closed=None,
     ):
         self.client = client
         self.risk_manager = risk_manager
         self.config = config
         self.on_position_closed = on_position_closed
+
         self.active_positions: Dict[str, ActivePosition] = {}
         self._pending_entries: Dict[str, asyncio.Task] = {}
+        self._recently_closed: Dict[str, float] = {}
         self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
 
-        # SL/TP settings
-        self.trailing_activation_pct = config.get("trailing_activation_pct", 1.0)
-        self.trailing_distance_pct = config.get("trailing_distance_pct", 0.5)
+        # SL/TP
+        self.trailing_activation_pct = config.get(
+            "trailing_activation_pct", 1.0,
+        )
+        self.trailing_distance_pct = config.get(
+            "trailing_distance_pct", 0.5,
+        )
         self.emergency_sl_pct = config.get("emergency_sl_pct", 2.5)
         self.max_hold_hours = config.get("max_hold_hours", 72)
-        self.move_sl_be_after_tp1 = config.get("move_sl_to_be_after_tp1", True)
-        self.move_sl_tp1_after_tp2 = config.get("move_sl_to_tp1_after_tp2", True)
+        self.move_sl_be_after_tp1 = config.get(
+            "move_sl_to_be_after_tp1", True,
+        )
+        self.move_sl_tp1_after_tp2 = config.get(
+            "move_sl_to_tp1_after_tp2", True,
+        )
 
         # Entry routing
-        self.entry_order_type = config.get("entry_order_type", "limit_preferred")
-        self.market_tolerance_pct = config.get("market_tolerance_pct", 0.15)
+        self.entry_order_type = config.get(
+            "entry_order_type", "limit_preferred",
+        )
+        self.market_tolerance_pct = config.get(
+            "market_tolerance_pct", 0.15,
+        )
         self.max_deviation_pct = config.get("max_deviation_pct", 3.0)
-        self.cancel_on_rally_pct = config.get("cancel_on_rally_pct", 1.5)
-        self.limit_expiry_min = config.get("limit_order_expiry_minutes", 30)
-        self.limit_check_interval_sec = config.get("limit_check_interval_sec", 20)
+        self.cancel_on_rally_pct = config.get(
+            "cancel_on_rally_pct", 1.5,
+        )
+        self.limit_expiry_min = config.get(
+            "limit_order_expiry_minutes", 30,
+        )
+        self.limit_check_interval_sec = config.get(
+            "limit_check_interval_sec", 20,
+        )
+        self.tp_placement_retries = config.get(
+            "tp_placement_retries", 2,
+        )
+        self.tp_placement_retry_delay = config.get(
+            "tp_placement_retry_delay_sec", 1.5,
+        )
+        self.tp_min_position_warn_usd = config.get(
+            "tp_min_position_warn_usd", 30.0,
+        )
 
     # ================================================================== #
     #  Helpers
@@ -148,32 +187,32 @@ class TradeExecutor:
 
     @staticmethod
     def _rally_pct(direction: str, entry: float, current: float) -> float:
-        """
-        Percentage price has rallied AWAY from entry in the trade's
-        missed direction. Positive = we missed the move. Zero or
-        negative = pullback or no change.
-        """
         if entry <= 0 or current <= 0:
             return 0.0
         if direction == "long":
             return max(0.0, (current - entry) / entry * 100)
-        else:  # short
-            return max(0.0, (entry - current) / entry * 100)
+        return max(0.0, (entry - current) / entry * 100)
 
-    def _rally_cancel_threshold(self, signal: TradeSignal) -> Optional[float]:
-        """Price at which the pending limit should be cancelled."""
+    def _rally_cancel_threshold(
+        self, signal: TradeSignal,
+    ) -> Optional[float]:
         if self.cancel_on_rally_pct <= 0:
             return None
         if signal.direction == "long":
-            return signal.entry_price * (1 + self.cancel_on_rally_pct / 100)
-        else:
-            return signal.entry_price * (1 - self.cancel_on_rally_pct / 100)
+            return signal.entry_price * (
+                1 + self.cancel_on_rally_pct / 100
+            )
+        return signal.entry_price * (
+            1 - self.cancel_on_rally_pct / 100
+        )
 
     # ================================================================== #
     #  Entry routing
     # ================================================================== #
     async def execute_signal(self, signal: TradeSignal) -> Dict:
-        approved, size_usd, reason = self.risk_manager.approve_trade(signal)
+        approved, size_usd, reason = self.risk_manager.approve_trade(
+            signal,
+        )
         if not approved:
             logger.warning(f"Trade rejected by risk manager: {reason}")
             return {"status": "rejected", "reason": reason}
@@ -181,12 +220,11 @@ class TradeExecutor:
         qty = size_usd / signal.entry_price
         signal.position_size_usd = size_usd
 
-        # Reject duplicate pending entries for same symbol
+        # Reject duplicate pending entries
         existing = self._pending_entries.get(signal.symbol)
         if existing is not None and not existing.done():
             logger.info(
-                f"{signal.symbol}: pending entry already in progress — "
-                f"skipping new signal"
+                f"{signal.symbol}: pending entry already in progress"
             )
             return {
                 "status": "pending_limit",
@@ -194,11 +232,20 @@ class TradeExecutor:
                 "symbol": signal.symbol,
             }
 
-        # Fetch price for routing decision
+        # Reject if already have an open position
+        if signal.symbol in self.active_positions:
+            logger.info(
+                f"{signal.symbol}: already have active position"
+            )
+            return {
+                "status": "rejected",
+                "reason": "position_exists",
+            }
+
         current_price = await self._get_current_price(signal.symbol)
         if current_price <= 0:
             logger.warning(
-                f"{signal.symbol}: cannot fetch current price — using market"
+                f"{signal.symbol}: no price — defaulting to market"
             )
             return await self._execute_market_entry(signal, qty)
 
@@ -216,7 +263,6 @@ class TradeExecutor:
             f"dev={deviation_pct:.3f}% rally={rally_pct:.3f}%"
         )
 
-        # Skip if signal is stale
         if deviation_pct > self.max_deviation_pct:
             logger.info(
                 f"{signal.symbol}: deviation {deviation_pct:.2f}% > "
@@ -224,46 +270,44 @@ class TradeExecutor:
             )
             return {"status": "skipped", "reason": "stale_entry"}
 
-        # Market mode — always market
         if self.entry_order_type == "market":
             return await self._execute_market_entry(signal, qty)
 
-        # Skip if price has already rallied past the cancel threshold
         if rally_pct > self.cancel_on_rally_pct:
             logger.info(
-                f"{signal.symbol}: price already rallied {rally_pct:.2f}% > "
-                f"cancel threshold {self.cancel_on_rally_pct}% — skipping"
+                f"{signal.symbol}: price already rallied "
+                f"{rally_pct:.2f}% > cancel threshold "
+                f"{self.cancel_on_rally_pct}% — skipping"
             )
             return {"status": "skipped", "reason": "rally_too_far"}
 
-        # Within tolerance — market order
         if deviation_pct <= self.market_tolerance_pct:
             logger.info(
                 f"{signal.symbol}: within tolerance "
-                f"({deviation_pct:.3f}% <= {self.market_tolerance_pct}%) "
-                f"— using MARKET order"
+                f"({deviation_pct:.3f}%) — MARKET order"
             )
             return await self._execute_market_entry(signal, qty)
 
-        # Limit mode
         if self.entry_order_type == "limit_only":
-            logger.info(f"{signal.symbol}: limit_only — using LIMIT")
+            logger.info(f"{signal.symbol}: limit_only — LIMIT")
         else:
             logger.info(
-                f"{signal.symbol}: dev {deviation_pct:.3f}% > tolerance "
-                f"{self.market_tolerance_pct}% — using LIMIT at "
+                f"{signal.symbol}: dev {deviation_pct:.3f}% > "
+                f"tolerance {self.market_tolerance_pct}% — LIMIT at "
                 f"{signal.entry_price:.6f}"
             )
         return await self._spawn_limit_entry(signal, qty)
 
     # ================================================================== #
-    #  MARKET entry
+    #  Market entry
     # ================================================================== #
     async def _execute_market_entry(
         self, signal: TradeSignal, qty: float,
     ) -> Dict:
         try:
-            await self.client.set_leverage(signal.symbol, signal.leverage)
+            await self.client.set_leverage(
+                signal.symbol, signal.leverage,
+            )
         except Exception as e:
             logger.debug(f"Leverage set: {e}")
 
@@ -273,17 +317,22 @@ class TradeExecutor:
                 f"Qty rounding failed for {signal.symbol}: "
                 f"{reason} (raw={qty})"
             )
-            return {"status": "error", "reason": f"qty_invalid: {reason}"}
+            return {
+                "status": "error",
+                "reason": f"qty_invalid: {reason}",
+            }
 
         ok, notional_reason = self.client.validate_notional(
             signal.symbol, rounded_qty, signal.entry_price,
         )
         if not ok:
             logger.error(
-                f"Notional check failed for {signal.symbol}: {notional_reason}"
+                f"Notional check failed for {signal.symbol}: "
+                f"{notional_reason}"
             )
             return {"status": "error", "reason": notional_reason}
 
+        # SL only — NO takeProfit attached (TP1/2/3 placed separately)
         try:
             response = await self.client.place_order_ws(
                 symbol=signal.symbol,
@@ -325,7 +374,9 @@ class TradeExecutor:
             stop_loss=signal.stop_loss,
             initial_stop_loss=signal.stop_loss,
             tps=signal.tp_list,
-            tp_weights=list(signal.tp_weights[:len(signal.tp_list)]),
+            tp_weights=list(
+                signal.tp_weights[:len(signal.tp_list)]
+            ),
             tp_order_ids=tp_order_ids,
             tp_filled={tp: False for tp in signal.tp_list},
             opened_at=datetime.utcnow().isoformat(),
@@ -340,7 +391,8 @@ class TradeExecutor:
             f"POSITION OPENED (market): {signal.symbol} {signal.side} "
             f"qty={rounded_qty} entry={signal.entry_price:.6f} "
             f"SL={signal.stop_loss:.6f} "
-            f"TPs={[round(t, 6) for t in signal.tp_list]}"
+            f"TPs={[round(t, 6) for t in signal.tp_list]} "
+            f"tp_orders={len(tp_order_ids)}"
         )
 
         return {
@@ -357,12 +409,14 @@ class TradeExecutor:
         }
 
     # ================================================================== #
-    #  LIMIT entry — spawns background tracker
+    #  Limit entry — background tracker
     # ================================================================== #
     async def _spawn_limit_entry(
         self, signal: TradeSignal, qty: float,
     ) -> Dict:
-        task = asyncio.create_task(self._track_limit_entry(signal, qty))
+        task = asyncio.create_task(
+            self._track_limit_entry(signal, qty)
+        )
         self._pending_entries[signal.symbol] = task
         return {
             "status": "pending_limit",
@@ -372,7 +426,9 @@ class TradeExecutor:
             "qty": qty,
         }
 
-    async def _track_limit_entry(self, signal: TradeSignal, qty: float):
+    async def _track_limit_entry(
+        self, signal: TradeSignal, qty: float,
+    ):
         try:
             await self._execute_limit_entry(signal, qty)
         except Exception as e:
@@ -383,9 +439,13 @@ class TradeExecutor:
         finally:
             self._pending_entries.pop(signal.symbol, None)
 
-    async def _execute_limit_entry(self, signal: TradeSignal, qty: float):
+    async def _execute_limit_entry(
+        self, signal: TradeSignal, qty: float,
+    ):
         try:
-            await self.client.set_leverage(signal.symbol, signal.leverage)
+            await self.client.set_leverage(
+                signal.symbol, signal.leverage,
+            )
         except Exception as e:
             logger.debug(f"Leverage set: {e}")
 
@@ -410,9 +470,11 @@ class TradeExecutor:
         limit_price = self.client.round_price(
             signal.symbol, signal.entry_price,
         )
-        tp1 = self.client.round_price(signal.symbol, signal.take_profit_1)
-        sl = self.client.round_price(signal.symbol, signal.stop_loss)
+        sl = self.client.round_price(
+            signal.symbol, signal.stop_loss,
+        )
 
+        # SL only on entry — NO takeProfit attached
         try:
             response = await self.client.place_order_ws(
                 symbol=signal.symbol,
@@ -427,7 +489,9 @@ class TradeExecutor:
                 tpsl_mode="Full",
             )
         except Exception as e:
-            logger.error(f"Limit placement failed for {signal.symbol}: {e}")
+            logger.error(
+                f"Limit placement failed for {signal.symbol}: {e}"
+            )
             return
 
         ret_code = response.get("retCode")
@@ -448,7 +512,7 @@ class TradeExecutor:
         logger.info(
             f"LIMIT ORDER PLACED: {signal.symbol} {signal.side} "
             f"qty={rounded_qty} @ {limit_price:.6f} "
-            f"TP1={tp1:.6f} SL={sl:.6f} orderId={order_id[:10]}"
+            f"SL={sl:.6f} orderId={order_id[:10]}"
         )
 
         fill = await self._wait_for_fill(
@@ -464,7 +528,7 @@ class TradeExecutor:
                 f"{fill['avg_price']:.6f} (planned {limit_price:.6f})"
             )
             await self._register_filled_position(
-                signal, fill["filled_qty"], fill["avg_price"], tp1, sl,
+                signal, fill["filled_qty"], fill["avg_price"], sl,
             )
             return
 
@@ -475,21 +539,21 @@ class TradeExecutor:
                 f"{fill['avg_price']:.6f} — cancelling remainder"
             )
             try:
-                await self.client.cancel_order_ws(signal.symbol, order_id)
+                await self.client.cancel_order_ws(
+                    signal.symbol, order_id,
+                )
             except Exception as e:
                 logger.warning(f"Cancel remainder failed: {e}")
             if fill["filled_qty"] > 0:
                 await self._register_filled_position(
-                    signal, fill["filled_qty"], fill["avg_price"],
-                    tp1, sl,
+                    signal, fill["filled_qty"], fill["avg_price"], sl,
                 )
             return
 
         if status == "cancelled_on_rally":
             logger.info(
                 f"LIMIT CANCELLED (rally): {signal.symbol} "
-                f"orderId={order_id[:10]} — price rallied away, "
-                f"missed entry"
+                f"orderId={order_id[:10]} — price rallied away"
             )
             return
 
@@ -506,14 +570,13 @@ class TradeExecutor:
                 f"orderId={order_id[:10]} — signal missed"
             )
             try:
-                await self.client.cancel_order_ws(signal.symbol, order_id)
+                await self.client.cancel_order_ws(
+                    signal.symbol, order_id,
+                )
             except Exception:
                 pass
             return
 
-    # ================================================================== #
-    #  Wait for fill with rally-cancel
-    # ================================================================== #
     async def _wait_for_fill(
         self,
         signal: TradeSignal,
@@ -521,10 +584,6 @@ class TradeExecutor:
         limit_price: float,
         total_qty: float,
     ) -> Dict:
-        """
-        Poll order status until filled, cancelled, rallied-away, or timed out.
-        Cancels the order immediately if price rallies past the threshold.
-        """
         deadline = time.time() + self.limit_expiry_min * 60
         cancel_threshold = self._rally_cancel_threshold(signal)
         last_check_pct = None
@@ -532,7 +591,6 @@ class TradeExecutor:
         while time.time() < deadline:
             await asyncio.sleep(self.limit_check_interval_sec)
 
-            # ---- Order status check ----
             try:
                 order = await self.client.get_order_status(
                     signal.symbol, order_id,
@@ -572,7 +630,7 @@ class TradeExecutor:
                         "avg_price": 0,
                     }
 
-            # ---- Rally check (only if still pending) ----
+            # Rally check
             if cancel_threshold is not None:
                 current = await self._get_current_price(signal.symbol)
                 if current > 0:
@@ -586,33 +644,29 @@ class TradeExecutor:
                             and current <= cancel_threshold)
                     )
 
-                    # Log when rally crosses threshold for first time
                     if rallied_away and last_check_pct != "rally":
                         logger.info(
                             f"{signal.symbol}: price rallied "
-                            f"{rally_pct:.2f}% past entry "
-                            f"(current={current:.6f} "
-                            f"threshold={cancel_threshold:.6f}) "
-                            f"— cancelling limit"
+                            f"{rally_pct:.2f}% past entry — "
+                            f"cancelling limit"
                         )
                         last_check_pct = "rally"
 
                     if rallied_away:
                         try:
-                            cancel_resp = await self.client.cancel_order_ws(
-                                signal.symbol, order_id,
+                            cancel_resp = (
+                                await self.client.cancel_order_ws(
+                                    signal.symbol, order_id,
+                                )
                             )
                             cancel_code = cancel_resp.get("retCode")
 
-                            # Cancel failed — order may have filled in
-                            # the window between our status check and cancel
+                            # Cancel failed — order may have filled
                             if cancel_code != 0:
-                                logger.debug(
-                                    f"Cancel retCode={cancel_code}, "
-                                    f"re-checking status"
-                                )
-                                order = await self.client.get_order_status(
-                                    signal.symbol, order_id,
+                                order = (
+                                    await self.client.get_order_status(
+                                        signal.symbol, order_id,
+                                    )
                                 )
                                 if order:
                                     s2 = order.get("orderStatus", "")
@@ -624,8 +678,8 @@ class TradeExecutor:
                                     )
                                     if s2 == "Filled" or cq > 0:
                                         logger.info(
-                                            f"{signal.symbol}: order filled "
-                                            f"despite rally cancel"
+                                            f"{signal.symbol}: order "
+                                            f"filled despite rally cancel"
                                         )
                                         return {
                                             "status": "filled",
@@ -644,13 +698,19 @@ class TradeExecutor:
                             "rally_pct": rally_pct,
                         }
 
-        # ---- Timeout: final check + cancel ----
+        # Timeout
         try:
             order = await self.client.get_order_status(
                 signal.symbol, order_id,
             )
-            cum_qty = float(order.get("cumExecQty", 0) or 0) if order else 0
-            avg_price = float(order.get("avgPrice", 0) or 0) if order else 0
+            cum_qty = (
+                float(order.get("cumExecQty", 0) or 0)
+                if order else 0
+            )
+            avg_price = (
+                float(order.get("avgPrice", 0) or 0)
+                if order else 0
+            )
         except Exception:
             cum_qty = 0
             avg_price = 0
@@ -672,17 +732,21 @@ class TradeExecutor:
             "avg_price": 0,
         }
 
-    # ================================================================== #
-    #  Post-fill registration
-    # ================================================================== #
     async def _register_filled_position(
         self,
         signal: TradeSignal,
         filled_qty: float,
         fill_price: float,
-        tp1: float,
         sl: float,
     ):
+        # Duplicate guard — prevents double-registration from a late fill
+        if signal.symbol in self.active_positions:
+            logger.warning(
+                f"{signal.symbol}: position already tracked, "
+                f"skipping re-register"
+            )
+            return
+
         tp_order_ids = await self._place_partial_tps(
             signal, filled_qty, fill_price,
         )
@@ -696,7 +760,9 @@ class TradeExecutor:
             stop_loss=sl,
             initial_stop_loss=sl,
             tps=signal.tp_list,
-            tp_weights=list(signal.tp_weights[:len(signal.tp_list)]),
+            tp_weights=list(
+                signal.tp_weights[:len(signal.tp_list)]
+            ),
             tp_order_ids=tp_order_ids,
             tp_filled={tp: False for tp in signal.tp_list},
             opened_at=datetime.utcnow().isoformat(),
@@ -711,18 +777,32 @@ class TradeExecutor:
             f"POSITION OPENED (limit): {signal.symbol} {signal.side} "
             f"qty={filled_qty} entry={fill_price:.6f} "
             f"SL={sl:.6f} "
-            f"TPs={[round(t, 6) for t in pos.tps]}"
+            f"TPs={[round(t, 6) for t in signal.tp_list]} "
+            f"tp_orders={len(tp_order_ids)}"
         )
 
+    # ================================================================== #
+    #  TP placement (all three as reduce-only limits)
+    # ================================================================== #
     async def _place_partial_tps(
         self,
         signal: TradeSignal,
         filled_qty: float,
         fill_price: float,
     ) -> Dict[float, str]:
+        tp_order_ids: Dict[float, str] = {}
+
+        # Warn if position is very small — some TPs may round to zero
+        notional = filled_qty * fill_price
+        if notional < self.tp_min_position_warn_usd:
+            logger.warning(
+                f"{signal.symbol}: position notional ${notional:.2f} "
+                f"< ${self.tp_min_position_warn_usd} — "
+                f"some TPs may round to zero"
+            )
+
         tps = signal.tp_list
         weights = list(signal.tp_weights[:len(tps)])
-        tp_order_ids: Dict[float, str] = {}
 
         for i, tp_price in enumerate(tps):
             w = weights[i] if i < len(weights) else 0.0
@@ -734,39 +814,66 @@ class TradeExecutor:
                 signal.symbol, tp_qty,
             )
             if rounded_tp_qty <= 0:
+                logger.warning(
+                    f"TP{i+1} qty too small for {signal.symbol}: "
+                    f"raw={tp_qty}"
+                )
                 continue
 
             rounded_tp_price = self.client.round_price(
                 signal.symbol, tp_price,
             )
 
-            try:
-                resp = await self.client.place_order_ws(
-                    symbol=signal.symbol,
-                    side="Sell" if signal.side == "Buy" else "Buy",
-                    qty=rounded_tp_qty,
-                    order_type="Limit",
-                    price=rounded_tp_price,
-                    reduce_only=True,
-                )
-                ret_code = resp.get("retCode")
-                if ret_code is not None and ret_code != 0:
-                    logger.warning(
-                        f"TP{i+1} rejected for {signal.symbol}: "
-                        f"retCode={ret_code} retMsg={resp.get('retMsg')}"
+            resp = None
+            for attempt in range(self.tp_placement_retries + 1):
+                try:
+                    resp = await self.client.place_order_ws(
+                        symbol=signal.symbol,
+                        side="Sell" if signal.side == "Buy" else "Buy",
+                        qty=rounded_tp_qty,
+                        order_type="Limit",
+                        price=rounded_tp_price,
+                        reduce_only=True,
                     )
-                    continue
-                order_id = self._extract_order_id(resp)
-                if order_id:
-                    tp_order_ids[rounded_tp_price] = order_id
-                    logger.info(
-                        f"TP{i+1} placed: {signal.symbol} "
-                        f"qty={rounded_tp_qty} @ "
-                        f"{rounded_tp_price:.6f} orderId={order_id[:10]}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"TP{i+1} placement failed for {signal.symbol}: {e}"
+                    if resp.get("retCode") == 0:
+                        break
+                    if attempt < self.tp_placement_retries:
+                        logger.warning(
+                            f"TP{i+1} attempt {attempt+1} failed: "
+                            f"retCode={resp.get('retCode')} "
+                            f"retMsg={resp.get('retMsg')} — retrying"
+                        )
+                        await asyncio.sleep(
+                            self.tp_placement_retry_delay,
+                        )
+                except Exception as e:
+                    if attempt < self.tp_placement_retries:
+                        logger.warning(
+                            f"TP{i+1} attempt {attempt+1} exception: "
+                            f"{e} — retrying"
+                        )
+                        await asyncio.sleep(
+                            self.tp_placement_retry_delay,
+                        )
+                    else:
+                        logger.error(
+                            f"TP{i+1} failed after "
+                            f"{self.tp_placement_retries + 1} "
+                            f"attempts: {e}"
+                        )
+
+            if not resp or resp.get("retCode") != 0:
+                continue
+
+            order_id = self._extract_order_id(resp)
+            if order_id:
+                tp_order_ids[rounded_tp_price] = order_id
+                logger.info(
+                    f"TP{i+1} placed: {signal.symbol} "
+                    f"qty={rounded_tp_qty} "
+                    f"({w*100:.0f}% of {filled_qty}) "
+                    f"@ {rounded_tp_price:.6f} "
+                    f"orderId={order_id[:10]}"
                 )
 
         return tp_order_ids
@@ -795,6 +902,13 @@ class TradeExecutor:
     async def _monitor_loop(self):
         while self._running:
             try:
+                # Prune stale _recently_closed entries
+                cutoff = time.time() - 300
+                self._recently_closed = {
+                    s: t for s, t in self._recently_closed.items()
+                    if t > cutoff
+                }
+
                 if not self.active_positions:
                     await asyncio.sleep(5)
                     continue
@@ -805,10 +919,12 @@ class TradeExecutor:
                     if abs(float(p.get("size", 0) or 0)) > 0
                 }
 
+                # Handle fully-closed positions
                 for sym in list(self.active_positions.keys()):
                     if sym not in live_map:
                         await self._handle_position_closed(sym)
 
+                # Process still-open positions
                 for sym, pos in self.active_positions.items():
                     if sym not in live_map:
                         continue
@@ -835,6 +951,7 @@ class TradeExecutor:
                         pos, live_qty, current_price,
                     )
 
+                    # Emergency SL
                     if pos.side == "Buy":
                         adverse = (
                             (pos.entry_price - current_price)
@@ -847,27 +964,37 @@ class TradeExecutor:
                         )
                     if adverse >= self.emergency_sl_pct:
                         logger.critical(
-                            f"EMERGENCY SL {sym}: adverse {adverse:.2f}%"
+                            f"EMERGENCY SL {sym}: "
+                            f"adverse {adverse:.2f}%"
                         )
+                        pos.exit_reason = "emergency_sl"
                         await self._emergency_close(pos)
 
+                    # Max hold
                     if pos.opened_at:
                         held = (
                             datetime.utcnow()
                             - datetime.fromisoformat(pos.opened_at)
                         ).total_seconds() / 3600
                         if held > self.max_hold_hours:
-                            logger.warning(f"Max hold exceeded for {sym}")
+                            logger.warning(
+                                f"Max hold exceeded for {sym}"
+                            )
                             pos.exit_reason = "max_hold"
                             await self._emergency_close(pos)
 
             except Exception as e:
-                logger.error(f"Monitor loop error: {e}", exc_info=True)
+                logger.error(
+                    f"Monitor loop error: {e}", exc_info=True,
+                )
 
             await asyncio.sleep(3)
 
     async def _detect_tp_fills(
-        self, pos: ActivePosition, live_qty: float, current_price: float,
+        self,
+        pos: ActivePosition,
+        live_qty: float,
+        current_price: float,
     ):
         cumulative = []
         acc = 0.0
@@ -896,7 +1023,9 @@ class TradeExecutor:
                     )
                     await self._on_tp_filled(pos, i)
 
-    async def _on_tp_filled(self, pos: ActivePosition, tp_index: int):
+    async def _on_tp_filled(
+        self, pos: ActivePosition, tp_index: int,
+    ):
         if tp_index == 0 and self.move_sl_be_after_tp1:
             await self._move_sl_to_breakeven(pos)
         elif tp_index == 1 and self.move_sl_tp1_after_tp2:
@@ -916,10 +1045,13 @@ class TradeExecutor:
             pos.stop_loss = new_sl
             pos.sl_moved_to_be = True
             logger.info(
-                f"{pos.symbol}: SL moved to BREAKEVEN ({new_sl:.6f})"
+                f"{pos.symbol}: SL moved to BREAKEVEN "
+                f"({new_sl:.6f})"
             )
         except Exception as e:
-            logger.error(f"SL-to-BE failed for {pos.symbol}: {e}")
+            logger.error(
+                f"SL-to-BE failed for {pos.symbol}: {e}"
+            )
 
     async def _move_sl_to_tp1(self, pos: ActivePosition):
         if pos.sl_moved_to_tp1 or not pos.tps:
@@ -935,58 +1067,120 @@ class TradeExecutor:
                 f"{pos.symbol}: SL moved to TP1 ({tp1:.6f})"
             )
         except Exception as e:
-            logger.error(f"SL-to-TP1 failed for {pos.symbol}: {e}")
+            logger.error(
+                f"SL-to-TP1 failed for {pos.symbol}: {e}"
+            )
 
+    # ================================================================== #
+    #  Position close handler — CRITICAL: del FIRST, then side effects
+    # ================================================================== #
     async def _handle_position_closed(self, symbol: str):
         pos = self.active_positions.get(symbol)
         if not pos:
             return
-        pnl_pct = (
-            pos.unrealized_pnl / (pos.entry_price * pos.total_qty) * 100
-            if pos.entry_price * pos.total_qty > 0 else 0.0
-        )
-        filled_tps = [tp for tp, f in pos.tp_filled.items() if f]
-        total_tps = len(pos.tps)
 
-        # Determine exit reason
-        if pos.exit_reason:
-            exit_reason = pos.exit_reason
-        elif len(filled_tps) == total_tps and total_tps > 0:
-            exit_reason = "tp_all"
-        elif pnl_pct < 0:
-            exit_reason = "sl_hit"
-        else:
-            exit_reason = "manual"
+        # ============================================================ #
+        # Remove from active_positions BEFORE any await. This prevents
+        # the monitor loop (which polls every 3s) from re-detecting the
+        # same close while slow work runs (chart, Discord, TP cancel).
+        # Without this, a single exception below re-triggers the close
+        # handler forever — the "position closed spamming" bug.
+        # ============================================================ #
+        del self.active_positions[symbol]
 
-        logger.info(
-            f"POSITION CLOSED: {symbol} "
-            f"PnL={pos.unrealized_pnl:.2f} ({pnl_pct:.2f}%) "
-            f"TPs hit: {len(filled_tps)}/{total_tps} "
-            f"reason={exit_reason}"
-        )
-        self.risk_manager.register_position_close(pnl_pct)
+        # Safety net: 60s cooldown per symbol (extra defense)
+        now = time.time()
+        last_closed = self._recently_closed.get(symbol, 0.0)
+        if now - last_closed < 60:
+            logger.debug(
+                f"{symbol}: close already processed "
+                f"{now - last_closed:.1f}s ago — skipping duplicate"
+            )
+            return
+        self._recently_closed[symbol] = now
 
-        # Notify via callback (main.py handles Discord)
-        if self.on_position_closed:
-            try:
-                await self.on_position_closed(
-                    symbol=symbol, pos=pos, pnl_pct=pnl_pct,
-                    filled_tps=filled_tps, exit_reason=exit_reason,
-                )
-            except Exception as e:
-                logger.error(f"Position closed callback error: {e}")
+        try:
+            pnl_pct = (
+                pos.unrealized_pnl / (pos.entry_price * pos.total_qty) * 100
+                if pos.entry_price * pos.total_qty > 0 else 0.0
+            )
+            filled_tps = [
+                tp for tp, f in pos.tp_filled.items() if f
+            ]
+            total_tps = len(pos.tps)
+
+            if pos.exit_reason:
+                exit_reason = pos.exit_reason
+            elif len(filled_tps) == total_tps and total_tps > 0:
+                exit_reason = "tp_all"
+            elif pnl_pct < 0:
+                exit_reason = "sl_hit"
+            else:
+                exit_reason = "manual"
+
+            logger.info(
+                f"POSITION CLOSED: {symbol} "
+                f"PnL={pos.unrealized_pnl:.2f} ({pnl_pct:.2f}%) "
+                f"TPs hit: {len(filled_tps)}/{total_tps} "
+                f"reason={exit_reason}"
+            )
+
+            self.risk_manager.register_position_close(pnl_pct)
+
+            if self.on_position_closed:
+                try:
+                    await self.on_position_closed(
+                        symbol=symbol,
+                        pos=pos,
+                        pnl_pct=pnl_pct,
+                        filled_tps=filled_tps,
+                        exit_reason=exit_reason,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Position closed callback error for "
+                        f"{symbol}: {e}"
+                    )
+
+            for tp_price, order_id in pos.tp_order_ids.items():
+                if not pos.tp_filled.get(tp_price):
+                    try:
+                        await self.client.cancel_order_ws(
+                            symbol=symbol, order_id=order_id,
+                        )
+                        logger.info(
+                            f"Canceled unfilled TP order "
+                            f"{order_id[:10]} for {symbol}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"TP cancel failed {order_id}: {e}"
+                        )
+
+        except Exception as e:
+            logger.error(
+                f"_handle_position_closed error for {symbol}: {e}",
+                exc_info=True,
+            )
 
     async def _emergency_close(self, pos: ActivePosition):
         try:
             if pos.exit_reason is None:
                 pos.exit_reason = "emergency_sl"
             await self.client.close_position_market(
-                symbol=pos.symbol, side=pos.side, qty=pos.remaining_qty,
+                symbol=pos.symbol,
+                side=pos.side,
+                qty=pos.remaining_qty,
             )
             logger.info(f"Emergency close {pos.symbol}")
         except Exception as e:
-            logger.error(f"Emergency close FAILED {pos.symbol}: {e}")
+            logger.error(
+                f"Emergency close FAILED {pos.symbol}: {e}"
+            )
 
+    # ================================================================== #
+    #  Lifecycle
+    # ================================================================== #
     async def close_all_positions(self):
         for sym, task in list(self._pending_entries.items()):
             if not task.done():
