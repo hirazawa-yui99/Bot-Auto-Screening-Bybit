@@ -820,6 +820,31 @@ class QuantBotV9:
             deriv=deriv,
             bias=bias,
         )
+        # Populate SL/TP on each setup using the configured R-multiples
+        for setup in setups.valid_setups:
+            try:
+                entry_mid = (
+                    setup.entry_zone_low + setup.entry_zone_high
+                ) / 2
+                _sl, _tp1, _tp2, _tp3 = self._compute_tp_levels(
+                    entry=entry_mid,
+                    atr=setup.atr,
+                    direction=setup.direction,
+                )
+                setup.sl = _sl
+                setup.tp1 = _tp1
+                setup.tp2 = _tp2
+                setup.tp3 = _tp3
+            except Exception as e:
+                logger.debug(
+                    f"{symbol}: SL/TP computation failed for "
+                    f"{setup.setup_type}: {e}"
+                )
+
+        if setups.count == 0:
+            logger.debug(f"{symbol}: no valid setups")
+            # ... rest of the rejection block unchanged
+            return
 
         if setups.count == 0:
             logger.debug(f"{symbol}: no valid setups")

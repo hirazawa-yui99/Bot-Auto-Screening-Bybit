@@ -1,10 +1,6 @@
 """
 notification/discord_bot.py
 Per-server Discord routing with combined and split modes.
-
-Config (config.json api.discord_servers):
-  Combined mode: single webhook receives all message types
-  Split mode:    live / quant / dashboard / alerts routed separately
 """
 import asyncio
 import json
@@ -456,7 +452,6 @@ class DiscordNotifier:
         signal_id: int = 0,
         delay_seconds: int = 0,
     ):
-        """Send signal alert (and quant breakdown if data provided)."""
         alert_embed = self._build_alert_embed(
             signal, breakdown, llm_response,
             setup_label=setup_label,
@@ -488,7 +483,6 @@ class DiscordNotifier:
         indicators: Dict,
         chart_path: Optional[str] = None,
     ):
-        """Legacy compatibility — send quant analysis standalone."""
         quant_embed = self._build_quant_embed(
             symbol, composite, breakdown, deriv, indicators,
         )
@@ -522,7 +516,10 @@ class DiscordNotifier:
         signal_id: int = 0,
         delay_seconds: int = 0,
     ):
-        """Send one combined message covering 1–2 setups."""
+        """
+        Combined message for 1–2 setups. Each setup field shows
+        entry zone, SL, and all three TPs.
+        """
         if not setups:
             return
 
@@ -539,24 +536,66 @@ class DiscordNotifier:
 
         fields = []
 
+        # ---- Per-setup field: entry, SL, TP1/TP2/TP3 ----
         for s in setups:
-            entry_mid = (
-                getattr(s, "entry_zone_low", 0.0)
-                + getattr(s, "entry_zone_high", 0.0)
-            ) / 2
+            direction = getattr(s, "direction", "neutral")
+            entry_low = getattr(s, "entry_zone_low", 0.0)
+            entry_high = getattr(s, "entry_zone_high", 0.0)
+            entry_mid = (entry_low + entry_high) / 2
+            atr = getattr(s, "atr", 0.0)
+            sl = getattr(s, "sl", 0.0)
+            tp1 = getattr(s, "tp1", 0.0)
+            tp2 = getattr(s, "tp2", 0.0)
+            tp3 = getattr(s, "tp3", 0.0)
+
+            def _pct(target: float, entry: float) -> str:
+                if entry <= 0 or target <= 0:
+                    return "—"
+                p = (target - entry) / entry * 100
+                if direction == "short":
+                    p = -p
+                return f"{p:+.2f}%"
+
+            lines = [
+                f"Direction: **{direction.upper()}** · "
+                f"Conf **{s.confidence:.0%}**",
+                f"Entry zone: `{entry_low:.6f}` – `{entry_high:.6f}` "
+                f"(mid `{entry_mid:.6f}`)",
+            ]
+
+            if sl > 0:
+                lines.append(
+                    f"🛑 **SL**: `{sl:.6f}` "
+                    f"({_pct(sl, entry_mid)})"
+                )
+            else:
+                lines.append("🛑 **SL**: —")
+
+            if tp1 > 0:
+                lines.append(
+                    f"🎯 **TP1**: `{tp1:.6f}` "
+                    f"({_pct(tp1, entry_mid)}) · 40%"
+                )
+            if tp2 > 0:
+                lines.append(
+                    f"🎯 **TP2**: `{tp2:.6f}` "
+                    f"({_pct(tp2, entry_mid)}) · 35%"
+                )
+            if tp3 > 0:
+                lines.append(
+                    f"🎯 **TP3**: `{tp3:.6f}` "
+                    f"({_pct(tp3, entry_mid)}) · 25%"
+                )
+
+            lines.append(f"ATR: `{atr:.6f}` · {s.reason}")
+
             fields.append({
                 "name": f"📐 {s.setup_type.upper()} ({s.timeframe})",
-                "value": (
-                    f"Direction: **{s.direction.upper()}**\n"
-                    f"Confidence: **{s.confidence:.0%}**\n"
-                    f"Entry: `{entry_mid:.6f}` "
-                    f"(zone `{s.entry_zone_low:.6f}`–`{s.entry_zone_high:.6f}`)\n"
-                    f"ATR: `{s.atr:.6f}`\n"
-                    f"Reason: {s.reason}"
-                ),
+                "value": "\n".join(lines),
                 "inline": False,
             })
 
+        # ---- Agreement ----
         if agreement is not None:
             details_str = ", ".join(
                 f"{k}={v}" for k, v in agreement.details.items()
@@ -572,6 +611,7 @@ class DiscordNotifier:
                 "inline": False,
             })
 
+        # ---- Fib + heatmap + SMC ----
         if fibo is not None and getattr(fibo, "valid", False):
             fields.append({
                 "name": "📊 Fibonacci",
@@ -585,15 +625,13 @@ class DiscordNotifier:
             })
 
         if heatmap is not None and getattr(heatmap, "valid", False):
-            strong_flag = getattr(
-                heatmap, "strong", getattr(heatmap, "strong", False)
-            )
             fields.append({
                 "name": "🔥 Heatmap",
                 "value": (
                     f"Imbalance: **{heatmap.imbalance:+.2f}**\n"
                     f"Direction: {heatmap.direction}\n"
-                    f"Strength: {'strong' if strong_flag else 'mild'}"
+                    f"Strength: "
+                    f"{'strong' if getattr(heatmap, 'strong', False) else 'mild'}"
                 ),
                 "inline": True,
             })
@@ -609,6 +647,7 @@ class DiscordNotifier:
                 "inline": True,
             })
 
+        # ---- Queue badge ----
         if signal_id > 0:
             if delay_seconds > 0:
                 fields.append({
@@ -628,12 +667,14 @@ class DiscordNotifier:
                     "inline": False,
                 })
 
+        # ---- Confidence ----
         if breakdown is not None:
             fields.append({
                 "name": "📊 Confidence",
                 "value": (
                     f"Raw: **{breakdown.raw_total:.1f}**/100\n"
-                    f"Calibrated: **{breakdown.calibrated_confidence:.1%}**"
+                    f"Calibrated: "
+                    f"**{breakdown.calibrated_confidence:.1%}**"
                 ),
                 "inline": True,
             })
@@ -676,7 +717,6 @@ class DiscordNotifier:
         qty: float,
         signal_id: int,
     ):
-        """Sent after the queue successfully fills a queued trade."""
         color = 0x3BA55D if direction == "long" else 0xED4245
         tp_lines = "\n".join(
             f"TP{i+1}: `${tp:.6f}`"
