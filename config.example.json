@@ -130,5 +130,20 @@
     "run_hour": 7,
     "auto_tune_min_samples": 30,
     "proven_edge_samples": 100
+  },
+
+  "setups": {
+    "scalp_rvol_min": 1.5,
+    "scalp_atr_pct_min": 0.4,
+    "scalp_half_life_max_hours": 4.0,
+    "intraday_rvol_min": 1.0,
+    "intraday_half_life_min_hours": 2.0,
+    "intraday_half_life_max_hours": 24.0,
+    "swing_rvol_min": 0.7,
+    "swing_half_life_min_hours": 24.0
+  },
+
+  "agreement": {
+    "min_agree": 2
   }
 }

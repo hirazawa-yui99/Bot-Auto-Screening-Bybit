@@ -443,16 +443,20 @@ class DiscordNotifier:
     #  Public API
     # ------------------------------------------------------------------ #
     async def send_signal_alert(
-        self,
-        signal,
-        breakdown,
-        llm_response: Dict,
+        self, signal, breakdown, llm_response: Dict,
         chart_path: Optional[str] = None,
-        composite=None,
-        deriv=None,
-        indicators: Optional[Dict] = None,
+        composite=None, deriv=None, indicators: Optional[Dict] = None,
+        setup_label: Optional[str] = None,      # NEW
     ):
         """Send signal alert (and quant breakdown if data provided)."""
+        title_prefix = f"[{setup_label.upper()}] " if setup_label else ""
+        embed = {
+            "title": (
+                f"{title_prefix}"
+                f"{'🟢' if signal.direction == 'long' else '🔴'} "
+                f"{signal.direction.upper()} SIGNAL · {signal.symbol}"
+            ),
+        }
         alert_embed = self._build_alert_embed(
             signal, breakdown, llm_response,
         )

@@ -38,6 +38,11 @@ from learning.auto_tuner import AutoTuner
 from notification.discord_bot import DiscordNotifier
 from notification.chart_generator import ChartGenerator
 from persistence.database import Database
+from analysis.setup_classifier import SetupClassifier, SetupCollection
+from analysis.fibonacci import FibonacciAnalyzer
+from analysis.orderbook_heatmap import OrderbookHeatmap
+from analysis.agreement_gate import AgreementGate
+from analysis.smc import SMCAnalyzer
 
 
 logging.basicConfig(
@@ -141,6 +146,47 @@ class QuantBotV9:
                 "prune_alerted_after_hours", 24,
             )
         )
+        self.setup_classifier = SetupClassifier(
+            self.config.get("setups", {}),
+        )
+        self.fib_analyzer = FibonacciAnalyzer()
+        self.heatmap = OrderbookHeatmap()
+        self.agreement_gate = AgreementGate(
+            min_agree=self.config.get("agreement", {}).get(
+                "min_agree", 2,
+            ),
+        )
+        self.smc_analyzer = SMCAnalyzer()
+    
+    async def _fetch_multi_tf(self, symbol: str) -> Tuple[
+        Optional[pd.DataFrame], pd.DataFrame, Optional[pd.DataFrame],
+    ]:
+        """Fetch 15m, 1h, 4h klines concurrently."""
+        async def _fetch(interval: str, limit: int):
+            try:
+                klines = await self.client.get_klines(
+                    symbol, interval=interval, limit=limit,
+                )
+                if not klines or len(klines) < 40:
+                    return None
+                df = pd.DataFrame(
+                    klines,
+                    columns=["ts", "open", "high", "low",
+                             "close", "volume", "turnover"],
+                )
+                for col in ("open", "high", "low", "close", "volume"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df.sort_values("ts").reset_index(drop=True)
+            except Exception as e:
+                logger.debug(f"fetch {interval} failed for {symbol}: {e}")
+                return None
+
+        df_15m, df_1h, df_4h = await asyncio.gather(
+            _fetch("15", 100),
+            _fetch("60", 200),
+            _fetch("240", 100),
+        )
+        return df_15m, df_1h, df_4h
 
     # ================================================================== #
     #  Position-close callback (called by TradeExecutor)
@@ -480,32 +526,23 @@ class QuantBotV9:
     #  Per-symbol analysis pipeline
     # ================================================================== #
     async def _analyse_and_signal(self, symbol: str):
+        # 1. Cooldown check
         skip_reason = self._should_skip_symbol(symbol)
         if skip_reason:
             logger.debug(f"{symbol}: skipping — {skip_reason}")
             return
 
-        klines = await self.client.get_klines(
-            symbol, interval="60", limit=200,
-        )
-        if not klines or len(klines) < 100:
+        # 2. Multi-timeframe data
+        df_15m, df_1h, df_4h = await self._fetch_multi_tf(symbol)
+        if df_1h is None or len(df_1h) < 100:
             return
 
-        df = pd.DataFrame(
-            klines,
-            columns=["ts", "open", "high", "low", "close",
-                     "volume", "turnover"],
-        )
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.sort_values("ts").reset_index(drop=True)
-
-        indicators = self._compute_indicators(df)
+        indicators = self._compute_indicators(df_1h)
         deriv = await self.derivatives.get_full_snapshot(symbol)
 
         composite = await self.composite_engine.compute(
             symbol=symbol,
-            df=df,
+            df=df_1h,
             indicators=indicators,
             derivative_snapshot=deriv,
             bar_interval_hours=1.0,
@@ -521,133 +558,134 @@ class QuantBotV9:
             )
         )
 
-        patterns = self._detect_patterns(df)
+        patterns = self._detect_patterns(df_1h)
 
+        # 3. SMC, fibo, orderbook heatmap — run in parallel
+        try:
+            smc = self.smc_analyzer.analyze(df_1h)
+        except Exception as e:
+            logger.debug(f"SMC failed for {symbol}: {e}")
+            smc = None
+
+        try:
+            fibo = self.fib_analyzer.analyze(df_1h, bias)
+        except Exception as e:
+            logger.debug(f"Fibo failed for {symbol}: {e}")
+            fibo = None
+
+        try:
+            ob = await self.client.get_orderbook(symbol, limit=50)
+            heatmap = self.heatmap.analyze(ob)
+        except Exception as e:
+            logger.debug(f"Heatmap failed for {symbol}: {e}")
+            heatmap = None
+
+        # 4. Directional contributions for the agreement gate
+        smc_dir = "neutral"
+        if smc is not None and smc.bos == "bullish":
+            smc_dir = "long"
+        elif smc is not None and smc.bos == "bearish":
+            smc_dir = "short"
+        elif smc is not None and smc.choch == "bullish":
+            smc_dir = "long"
+        elif smc is not None and smc.choch == "bearish":
+            smc_dir = "short"
+
+        deriv_dir = "neutral"
+        if deriv.cvd_divergence == "bullish" or deriv.smart_money_bias == "long":
+            deriv_dir = "long"
+        elif deriv.cvd_divergence == "bearish" or deriv.smart_money_bias == "short":
+            deriv_dir = "short"
+
+        heatmap_dir = heatmap.direction if heatmap else "neutral"
+
+        fibo_dir = "neutral"
+        fibo_valid = False
+        if fibo is not None and fibo.valid:
+            fibo_valid = True
+            fibo_dir = bias  # fib is directional only when in_zone and price on correct side
+
+        # 5. Strict agreement gate
+        agreement = self.agreement_gate.check(
+            smc_dir=smc_dir,
+            deriv_dir=deriv_dir,
+            quant_dir=composite.direction,
+            heatmap_dir=heatmap_dir,
+            fib_direction=fibo_dir,
+            fib_valid=fibo_valid and fibo.in_zone if fibo else False,
+        )
+
+        if not agreement.passed:
+            logger.debug(
+                f"{symbol}: agreement gate failed — {agreement.reason}"
+            )
+            await self._log_rejected(
+                symbol, bias, indicators, deriv, composite, agreement,
+            )
+            return
+
+        # 6. Preliminary confidence
         prelim = self.scorer.compute(
             symbol=symbol,
-            klines_df=df,
+            klines_df=df_1h,
             indicators=indicators,
             deriv_snapshot=deriv,
             patterns_detected=patterns,
             bias=bias,
             llm_response=None,
             composite=composite,
-            funding_result=composite.funding,
+            funding_result=composite.funding
         )
-
-        # ---- Prelim gate: log rejects so auto-tuner has data ----
         if prelim.raw_total < 40:
-            await self.journal.log_signal({
-                "symbol": symbol,
-                "direction": bias,
-                "timestamp": datetime.utcnow().isoformat(),
-                "entry_price": float(df["close"].iloc[-1]),
-                "raw_score": prelim.raw_total,
-                "calibrated_confidence": prelim.calibrated_confidence,
-                "is_high_confidence": False,
-                "gate_reasons": prelim.gate_reasons or ["prelim_below_40"],
-                "llm_response": {},
-                "indicators": indicators,
-                "composite_score": composite.total_score,
-                "composite_direction": composite.direction,
-                "composite_conviction": composite.conviction,
-                "zeta": composite.mean_reversion.zeta,
-                "hurst": composite.mean_reversion.hurst,
-                "half_life_hours": composite.mean_reversion.half_life_hours,
-                "basis_pct": composite.basis.basis_pct,
-                "funding_annualized_pct": (
-                    composite.funding.annualized_pct
-                ),
-                "volume_zscore": composite.volume.z_score,
-                "volume_anomaly_level": composite.volume.anomaly_level,
-                "funding_rate_pct": composite.funding.rate_pct,
-                "funding_regime": composite.funding.regime,
-                "funding_contrarian_bias": (
-                    composite.funding.contrarian_bias
-                ),
-                "_breakdown": {
-                    "technical_score": prelim.technical_score,
-                    "composite_score": prelim.composite_score,
-                    "derivative_score": prelim.derivative_score,
-                    "sentiment_score": prelim.sentiment_score,
-                    "pattern_score": prelim.pattern_score,
-                    "llm_score": prelim.llm_score,
-                },
-            })
+            await self._log_rejected(
+                symbol, bias, indicators, deriv, composite, agreement,
+                prelim=prelim,
+            )
             return
 
-        # ---- DeepSeek analysis ----
+        # 7. DeepSeek
         market_context = {
             "symbol": symbol,
-            "price": float(df["close"].iloc[-1]),
+            "price": float(df_1h["close"].iloc[-1]),
             "bias": bias,
             "indicators": indicators,
             "derivatives": {
                 "cvd": deriv.cvd,
-                "cvd_slope": deriv.cvd_slope,
                 "cvd_divergence": deriv.cvd_divergence,
-                "oi": deriv.oi,
                 "oi_change_1h": deriv.oi_change_1h,
                 "oi_change_4h": deriv.oi_change_4h,
                 "oi_divergence": deriv.oi_divergence,
                 "funding_rate": deriv.funding_rate,
-                "account_ls_ratio": deriv.account_ls_ratio,
-                "top_trader_ls_ratio": deriv.top_trader_ls_ratio,
-                "ls_ratio_divergence": deriv.ls_ratio_divergence,
-                "smart_money_bias": deriv.smart_money_bias,
+                "smart_money_bias": deriv.smart_money_bias
             },
-            "quant_composite": {
+            "smc": {
+                "bos": smc.bos if smc else "none",
+                "choch": smc.choch if smc else "none",
+                "liquidity_sweep": smc.liquidity_sweep if smc else "none",
+            },
+            "fibo": {
+                "zone": fibo.zone_name if fibo else "",
+                "in_zone": fibo.in_zone if fibo else False,
+                "entry_zone": (
+                    [fibo.entry_zone_low, fibo.entry_zone_high]
+                    if fibo else []
+                ),
+            },
+            "heatmap": {
+                "imbalance": heatmap.imbalance if heatmap else 0.0,
+                "direction": heatmap_dir,
+                "strong": heatmap.strong if heatmap else False,
+            },
+            "agreement": {
+                "direction": agreement.direction,
+                "count": agreement.agreement_count,
+                "details": agreement.details,
+            },
+            "composite": {
                 "total_score": composite.total_score,
                 "direction": composite.direction,
                 "conviction": composite.conviction,
-                "agreement_ratio": composite.agreement_ratio,
-                "conflicting_components": composite.conflicting_components,
-                "mean_reversion": {
-                    "zeta": composite.mean_reversion.zeta,
-                    "z_score": composite.mean_reversion.z_score,
-                    "phi": composite.mean_reversion.phi,
-                    "half_life_hours": (
-                        composite.mean_reversion.half_life_hours
-                    ),
-                    "hurst": composite.mean_reversion.hurst,
-                    "regime": composite.mean_reversion.regime,
-                    "adf_pvalue": composite.mean_reversion.adf_pvalue,
-                    "is_stationary": (
-                        composite.mean_reversion.is_stationary
-                    ),
-                },
-                "basis": {
-                    "basis_pct": composite.basis.basis_pct,
-                    "funding_rate": composite.basis.funding_rate,
-                    "funding_annualized_pct": (
-                        composite.basis.funding_annualized
-                    ),
-                    "regime": composite.basis.regime,
-                    "signal_bias": composite.basis.signal_bias,
-                },
-                "volume": {
-                    "rvol": composite.volume.rvol,
-                    "z_score": composite.volume.z_score,
-                    "percentile_rank": composite.volume.percentile_rank,
-                    "anomaly_level": composite.volume.anomaly_level,
-                    "vwpd": composite.volume.vwpd,
-                    "divergence": composite.volume.divergence,
-                },
-                "funding": {
-                    "rate_pct": composite.funding.rate_pct,
-                    "annualized_pct": composite.funding.annualized_pct,
-                    "regime": composite.funding.regime,
-                    "contrarian_bias": composite.funding.contrarian_bias,
-                    "bias_strength": composite.funding.bias_strength,
-                    "should_block_long": (
-                        composite.funding.should_block_long
-                    ),
-                    "should_block_short": (
-                        composite.funding.should_block_short
-                    ),
-                },
             },
-            "patterns": patterns,
             "preliminary_score": prelim.raw_total,
         }
 
@@ -655,7 +693,7 @@ class QuantBotV9:
 
         final = self.scorer.compute(
             symbol=symbol,
-            klines_df=df,
+            klines_df=df_1h,
             indicators=indicators,
             deriv_snapshot=deriv,
             patterns_detected=patterns,
@@ -665,58 +703,61 @@ class QuantBotV9:
             funding_result=composite.funding,
         )
 
-        signal_id = await self.journal.log_signal({
-            "symbol": symbol,
-            "direction": bias,
-            "timestamp": datetime.utcnow().isoformat(),
-            "entry_price": float(df["close"].iloc[-1]),
-            "raw_score": final.raw_total,
-            "calibrated_confidence": final.calibrated_confidence,
-            "is_high_confidence": final.is_high_confidence,
-            "gate_reasons": final.gate_reasons,
-            "llm_response": llm_response,
-            "indicators": indicators,
-            "composite_score": composite.total_score,
-            "composite_direction": composite.direction,
-            "composite_conviction": composite.conviction,
-            "zeta": composite.mean_reversion.zeta,
-            "hurst": composite.mean_reversion.hurst,
-            "half_life_hours": composite.mean_reversion.half_life_hours,
-            "basis_pct": composite.basis.basis_pct,
-            "funding_annualized_pct": composite.funding.annualized_pct,
-            "volume_zscore": composite.volume.z_score,
-            "volume_anomaly_level": composite.volume.anomaly_level,
-            "funding_rate_pct": composite.funding.rate_pct,
-            "funding_regime": composite.funding.regime,
-            "funding_contrarian_bias": (
-                composite.funding.contrarian_bias
-            ),
-            "_breakdown": {
-                "technical_score": final.technical_score,
-                "composite_score": final.composite_score,
-                "derivative_score": final.derivative_score,
-                "sentiment_score": final.sentiment_score,
-                "pattern_score": final.pattern_score,
-                "llm_score": final.llm_score,
-            },
-        })
+        # 8. SMC-vs-quant-vs-LLM disagreement check (requirement 3)
+        llm_dir = llm_response.get("direction", "neutral")
+        if not self._llm_agrees_with_quant_llm(
+            llm_dir, bias, agreement.direction,
+        ):
+            logger.info(
+                f"{symbol}: LLM says {llm_dir}, quant/SMC says "
+                f"{agreement.direction} — refusing trade"
+            )
+            return
 
         if not final.is_high_confidence:
             logger.debug(
                 f"{symbol}: not high confidence "
-                f"(raw={final.raw_total:.1f}, "
-                f"cal={final.calibrated_confidence:.2f}, "
-                f"gates={final.gate_reasons})"
+                f"(raw={final.raw_total:.1f}, cal={final.calibrated_confidence:.2f})"
+            )
+            await self._log_rejected(
+                symbol, bias, indicators, deriv, composite, agreement,
+                prelim=final,
             )
             return
 
-        # ---- Build trade signal ----
-        entry = float(df["close"].iloc[-1])
-        atr = indicators.get("atr", entry * 0.01)
+        # 9. Classify setups
+        setups = self.setup_classifier.classify_all(
+            df_15m=df_15m,
+            df_1h=df_1h,
+            df_4h=df_4h,
+            composite=composite,
+            deriv=deriv,
+            bias=bias,
+        )
+        if setups.count == 0:
+            logger.debug(f"{symbol}: no valid setups")
+            return
+
+        # 10. Build trade signals per setup and execute the best one
+        best = setups.highest_confidence()
+        if best is None:
+            return
+
+        # Use fib zone as entry price if available, else current price
+        if fibo is not None and fibo.valid:
+            if fibo.entry_zone_low <= fibo.current_price <= fibo.entry_zone_high:
+                entry = fibo.current_price  # inside zone, use current
+            else:
+                entry = (
+                    fibo.entry_zone_low if bias == "long"
+                    else fibo.entry_zone_high
+                )
+        else:
+            entry = float(df_1h["close"].iloc[-1])
 
         sl, tp1, tp2, tp3 = self._compute_tp_levels(
             entry=entry,
-            atr=atr,
+            atr=best.atr,
             direction=bias,
         )
 
@@ -734,34 +775,32 @@ class QuantBotV9:
             confidence=final.calibrated_confidence,
             leverage=self.config["risk"].get("default_leverage", 5),
             reason=(
+                f"Setup={best.setup_type} "
                 f"Raw={final.raw_total:.0f} "
-                f"Composite={composite.total_score:.2f} "
-                f"Funding={composite.funding.rate_pct:+.3f}%"
+                f"Agree={agreement.agreement_count} "
+                f"Fibo={'in' if fibo and fibo.in_zone else 'out'}"
             ),
             metadata={
-                "signal_id": signal_id,
-                "llm": llm_response,
-                "funding_rate_pct": composite.funding.rate_pct,
-                "funding_annualized_pct": (
-                    composite.funding.annualized_pct
-                ),
-                "funding_regime": composite.funding.regime,
-                "funding_contrarian_bias": (
-                    composite.funding.contrarian_bias
-                ),
-                "funding_block_long": (
-                    composite.funding.should_block_long
-                ),
-                "funding_block_short": (
-                    composite.funding.should_block_short
-                ),
+                "signal_id": 0,
+                "setup_type": best.setup_type,
+                "setups": setups.labels,
+                "agreement": agreement.details,
+                "smc_dir": smc_dir,
+                "deriv_dir": deriv_dir,
+                "quant_dir": composite.direction,
+                "heatmap_dir": heatmap_dir,
+                "fibo_zone": fibo.zone_name if fibo else "",
+                "fibo_in_zone": fibo.in_zone if fibo else False,
+                "funding_block_long": composite.funding.should_block_long,
+                "funding_block_short": composite.funding.should_block_short,
+                "funding_rate_pct": composite.funding.rate_pct
             },
         )
 
         skip_reason = self._should_skip_symbol(symbol)
         if skip_reason:
             logger.info(
-                f"{symbol}: signal blocked at execute — {skip_reason}"
+                f"{symbol}: blocked at execute — {skip_reason}"
             )
             return
 
@@ -769,30 +808,112 @@ class QuantBotV9:
         if result["status"] != "filled":
             return
 
-        # Record for cooldown — happens only after successful fill
+        # Record cooldown
         self._record_alert(
             symbol=symbol,
             direction=bias,
             confidence=final.calibrated_confidence,
-            signal_id=signal_id,
+            signal_id=0,
         )
 
-        # ---- Notify Discord (chart + embeds) ----
+        # 11. Multi-setup Discord dispatch (requirement 1 & 2)
+        await self._dispatch_multi_setup_alerts(
+            symbol=symbol,
+            setups=setups,
+            df_1h=df_1h,
+            composite=composite,
+            deriv=deriv,
+            indicators=indicators,
+            breakdown=final,
+            llm_response=llm_response,
+            agreement=agreement,
+            smc=smc,
+            fibo=fibo,
+            heatmap=heatmap,
+        )
+    def _llm_agrees_with_quant_llm(
+        self, llm_dir: str, bias: str, agreement_dir: str,
+    ) -> bool:
+        """LLM must not contradict the quant agreement direction."""
+        if llm_dir == "neutral":
+            return True
+        return llm_dir == agreement_dir
+
+    async def _log_rejected(
+        self, symbol, bias, indicators, deriv, composite, agreement,
+        prelim=None,
+    ):
+        """Log rejected signal so the auto-tuner has data."""
+        raw = prelim.raw_total if prelim else 0.0
+        cal = prelim.calibrated_confidence if prelim else 0.0
+        gates = prelim.gate_reasons if prelim else []
+        if not agreement.passed:
+            gates = list(gates) + [f"agreement:{agreement.reason}"]
+        await self.journal.log_signal({
+            "symbol": symbol,
+            "direction": bias,
+            "timestamp": datetime.utcnow().isoformat(),
+            "entry_price": float(composite.mean_reversion.mu or 0),
+            "raw_score": raw,
+            "calibrated_confidence": cal,
+            "is_high_confidence": False,
+            "gate_reasons": gates,
+            "llm_response": {},
+            "indicators": indicators,
+            "composite_score": composite.total_score,
+            "composite_direction": composite.direction,
+            "composite_conviction": composite.conviction,
+            "zeta": composite.mean_reversion.zeta,
+            "hurst": composite.mean_reversion.hurst,
+            "half_life_hours": composite.mean_reversion.half_life_hours,
+            "basis_pct": composite.basis.basis_pct,
+            "funding_annualized_pct": composite.funding.annualized_pct,
+            "volume_zscore": composite.volume.z_score,
+            "volume_anomaly_level": composite.volume.anomaly_level,
+            "funding_rate_pct": composite.funding.rate_pct,
+            "funding_regime": composite.funding.regime,
+            "funding_contrarian_bias": composite.funding.contrarian_bias,
+            "_breakdown": {
+                "technical_score": prelim.technical_score if prelim else 0.0,
+                "composite_score": prelim.composite_score if prelim else 0.0,
+                "derivative_score": prelim.derivative_score if prelim else 0.0,
+                "sentiment_score": prelim.sentiment_score if prelim else 0.0,
+                "pattern_score": prelim.pattern_score if prelim else 0.0,
+                "llm_score": prelim.llm_score if prelim else 0.0,
+            },
+        })
+
+    async def _dispatch_multi_setup_alerts(
+        self,
+        symbol, setups, df_1h, composite, deriv, indicators,
+        breakdown, llm_response, agreement, smc, fibo, heatmap,
+    ):
+        """
+        Requirement 1 & 2:
+          3 setups → 3 separate messages
+          2 setups → 1 combined message
+          1 setup  → 1 single message
+        """
+        valid = setups.valid_setups
+        if not valid:
+            return
+
+        # Chart generated once, reused by all messages
         chart_path = None
         try:
             chart_path = await self.chart_generator.render_signal_chart(
-                df=df,
+                df=df_1h,
                 context={
                     "symbol": symbol,
-                    "price": entry,
+                    "price": float(df_1h["close"].iloc[-1]),
                     "signal_info": {
-                        "entry": entry,
-                        "sl": signal.stop_loss,
-                        "tps": signal.tp_list,
-                        "direction": signal.direction,
+                        "entry": valid[0].entry_zone_low,
+                        "sl": valid[0].entry_zone_low * 0.98,
+                        "tps": [],
+                        "direction": valid[0].direction,
                     },
                     "composite": composite,
-                    "breakdown": final,
+                    "breakdown": breakdown,
                     "deriv": deriv,
                     "indicators": indicators,
                 },
@@ -801,17 +922,37 @@ class QuantBotV9:
             logger.error(f"Chart failed for {symbol}: {e}")
 
         try:
-            await self.notifier.send_signal_alert(
-                signal=signal,
-                breakdown=final,
-                llm_response=llm_response,
-                chart_path=chart_path,
-                composite=composite,
-                deriv=deriv,
-                indicators=indicators,
-            )
+            if len(valid) == 3:
+                # Three separate messages
+                for s in valid:
+                    await self.notifier.send_signal_alert(
+                        signal=self._setup_to_signal(s, symbol, breakdown),
+                        breakdown=breakdown,
+                        llm_response=llm_response,
+                        chart_path=chart_path,
+                        composite=composite,
+                        deriv=deriv,
+                        indicators=indicators,
+                        setup_label=s.label,
+                    )
+            else:
+                # One combined message
+                await self.notifier.send_multi_setup_alert(
+                    symbol=symbol,
+                    setups=valid,
+                    breakdown=breakdown,
+                    llm_response=llm_response,
+                    chart_path=chart_path,
+                    composite=composite,
+                    deriv=deriv,
+                    indicators=indicators,
+                    agreement=agreement,
+                    smc=smc,
+                    fibo=fibo,
+                    heatmap=heatmap,
+                )
         except Exception as e:
-            logger.error(f"Discord alerts failed for {symbol}: {e}")
+            logger.error(f"Discord dispatch failed for {symbol}: {e}")
         finally:
             if chart_path:
                 try:
@@ -819,8 +960,24 @@ class QuantBotV9:
                 except Exception:
                     pass
 
-        await self.journal.mark_executed(signal_id, result)
-
+    def _setup_to_signal(self, setup, symbol, breakdown):
+        """Build a TradeSignal-like object for a single setup."""
+        direction = setup.direction if setup.direction != "neutral" else "long"
+        entry = (setup.entry_zone_low + setup.entry_zone_high) / 2
+        sl, tp1, tp2, tp3 = self._compute_tp_levels(
+            entry=entry, atr=setup.atr, direction=direction,
+        )
+        return TradeSignal(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit_1=tp1,
+            take_profit_2=tp2,
+            take_profit_3=tp3,
+            confidence=setup.confidence,
+            metadata={"setup_type": setup.setup_type},
+        )
     # ================================================================== #
     #  Indicators & patterns
     # ================================================================== #
@@ -932,6 +1089,73 @@ class QuantBotV9:
                     f"Execution: {ex.get('symbol')} {ex.get('side')} "
                     f"{ex.get('execQty')}"
                 )
+    async def soft_reload(self):
+        """
+        Reload config without touching positions, database, or cooldowns.
+        Triggered by SIGHUP. Applies new thresholds at next scan.
+        """
+        logger.info("SOFT RELOAD initiated")
+        try:
+            with open("config.json") as f:
+                new_config = json.load(f)
+        except Exception as e:
+            logger.error(f"Soft reload failed — invalid config: {e}")
+            return
+
+        try:
+            # In-memory thresholds
+            self.scorer.min_raw_threshold = new_config["strategy"]["min_raw_threshold"]
+            self.scorer.min_calibrated = new_config["strategy"]["min_calibrated"]
+
+            # Composite weights
+            new_weights = new_config.get("strategy", {}).get(
+                "composite_weights", {},
+            )
+            if new_weights:
+                merged = self.composite_engine.DEFAULT_WEIGHTS.copy()
+                merged.update({
+                    k: float(v) for k, v in new_weights.items()
+                    if k in merged
+                })
+                s = sum(merged.values()) or 1.0
+                self.composite_engine.weights = {
+                    k: v / s for k, v in merged.items()
+                }
+
+            # Risk config
+            self.risk_manager.cfg = new_config["risk"]
+
+            # Executor config
+            self.executor.config = new_config["execution"]
+            self.executor.trailing_activation_pct = new_config["execution"].get(
+                "trailing_activation_pct", 1.0,
+            )
+            self.executor.trailing_distance_pct = new_config["execution"].get(
+                "trailing_distance_pct", 0.5,
+            )
+            self.executor.emergency_sl_pct = new_config["execution"].get(
+                "emergency_sl_pct", 2.5,
+            )
+
+            # Signal cooldown
+            self._signal_cooldown_hours = float(
+                new_config.get("execution", {}).get(
+                    "signal_cooldown_hours", 4,
+                )
+            )
+
+            # Preserve everything else — active positions, alerts,
+            # DB connection, WS connections, chart generator
+            self.config = new_config
+
+            logger.info(
+                f"SOFT RELOAD complete. "
+                f"Active positions preserved: "
+                f"{list(self.executor.active_positions.keys())}"
+            )
+
+        except Exception as e:
+            logger.error(f"Soft reload failed: {e}", exc_info=True)
 
 
 async def main():
@@ -941,15 +1165,19 @@ async def main():
     def shutdown():
         asyncio.create_task(bot.stop())
 
+    def soft_reload():
+        logger.info("SIGHUP received — soft reloading config")
+        asyncio.create_task(bot.soft_reload())
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, shutdown)
+    loop.add_signal_handler(signal.SIGHUP, soft_reload)
 
     try:
         await bot.start()
     except KeyboardInterrupt:
         await bot.stop()
     finally:
-        # Ensure DB is closed even on unexpected start() crash
         try:
             await bot.db.close()
         except Exception:

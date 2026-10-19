@@ -29,6 +29,19 @@ class RiskManager:
         self.state = RiskState(day_start_ts=time.time())
         self.kill_switch = False
 
+    @staticmethod
+    def _confidence_to_pct(confidence: float) -> float:
+        """Map confidence 0..1 to position % of equity: 0.5% to 3.0%."""
+        if confidence >= 0.85:
+            return 3.0
+        if confidence >= 0.75:
+            return 2.0
+        if confidence >= 0.65:
+            return 1.5
+        if confidence >= 0.55:
+            return 1.0
+        return 0.5
+
     def _maybe_reset_daily(self):
         now = time.time()
         if now - self.state.day_start_ts >= 86_400:
@@ -80,17 +93,16 @@ class RiskManager:
 
         # ---- Position sizing ----
         equity = self.state.current_equity or 100.0
-        max_pct = self.cfg.get("max_position_pct", 2.0) / 100.0
-        size_usd = equity * max_pct
-
         conf = getattr(signal, "confidence", 0.5)
-        size_usd *= min(1.5, max(0.5, conf / 0.7))
+        size_pct = self._confidence_to_pct(conf) / 100.0
+        size_usd = equity * size_pct
 
+        # Cap by leverage
         leverage = getattr(signal, "leverage", 5)
-        notional_cap = equity * leverage * max_pct
+        notional_cap = equity * leverage * size_pct
         size_usd = min(size_usd, notional_cap)
 
-        return True, size_usd, "approved"
+        return True, size_usd, f"approved:{size_pct*100:.1f}%"
 
     def update_equity(self, equity: float):
         self.state.current_equity = equity
