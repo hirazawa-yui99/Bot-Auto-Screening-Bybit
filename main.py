@@ -1167,7 +1167,7 @@ class QuantBotV9:
                 except Exception:
                     pass
 
-        def _setup_to_signal(self, setup, symbol, breakdown):
+    def _setup_to_signal(self, setup, symbol, breakdown):
         """Build a TradeSignal-compatible object for one setup."""
         direction = (
             setup.direction if setup.direction != "neutral" else "long"
