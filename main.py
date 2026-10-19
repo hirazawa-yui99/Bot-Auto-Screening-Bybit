@@ -43,6 +43,7 @@ from analysis.fibonacci import FibonacciAnalyzer
 from analysis.orderbook_heatmap import OrderbookHeatmap
 from analysis.agreement_gate import AgreementGate
 from analysis.smc import SMCAnalyzer
+from execution.signal_queue import SignalQueue
 
 
 logging.basicConfig(
@@ -138,12 +139,12 @@ class QuantBotV9:
         self._alerted_signals: Dict[str, Dict] = {}
         self._signal_cooldown_hours: float = float(
             self.config.get("execution", {}).get(
-                "signal_cooldown_hours", 4,
+                "signal_cooldown_hours", 2,
             )
         )
         self._prune_alerted_after_hours: float = float(
             self.config.get("execution", {}).get(
-                "prune_alerted_after_hours", 24,
+                "prune_alerted_after_hours", 12,
             )
         )
         self.setup_classifier = SetupClassifier(
@@ -157,6 +158,13 @@ class QuantBotV9:
             ),
         )
         self.smc_analyzer = SMCAnalyzer()
+        self.signal_queue = SignalQueue(
+        self.db, self.config.get("auto_trade", {}),
+        )
+        self.signal_queue.attach(
+            self.executor,
+            on_filled=self._on_trade_filled,
+        )
     
     async def _fetch_multi_tf(self, symbol: str) -> Tuple[
         Optional[pd.DataFrame], pd.DataFrame, Optional[pd.DataFrame],
@@ -347,6 +355,9 @@ class QuantBotV9:
         self._running = True
         await self.client.start()
         await self.db.connect()
+        await self.executor.start_monitor()
+        await self.signal_queue.start()          # ← must be here
+
         try:
             rows = await self.db.fetch(
                 "SELECT symbol, alerted_at, direction, confidence, signal_id "
@@ -411,6 +422,7 @@ class QuantBotV9:
                 )
 
         # 3. Close resources in order
+        await self.signal_queue.stop()            # ← must be here
         await self.executor.stop_monitor()
         await self.executor.close_all_positions()
         await self.client.stop()
