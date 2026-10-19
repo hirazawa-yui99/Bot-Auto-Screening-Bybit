@@ -646,29 +646,28 @@ class QuantBotV9:
                 logger.info("Scan loop exiting (shutdown signaled)")
                 return
 
-    # ================================================================== #
-    #  Per-symbol analysis pipeline
-    # ================================================================== #
     async def _analyse_and_signal(self, symbol: str):
         """
-        Full analysis pipeline for a single symbol.
+        Full analysis pipeline for one symbol.
 
-        Flow:
-          1. Cooldown check          → skip if recently alerted
-          2. Multi-TF fetch (15m/1h/4h)
-          3. Indicators + derivatives + composite
-          4. SMC + Fibonacci + orderbook heatmap
-          5. Agreement gate          → skip if contradiction
-          6. Preliminary confidence  → skip if raw < 40
-          7. DeepSeek analysis
-          8. Final confidence + LLM agreement check
-          9. Setup classification    → skip if 0 setups
-          10. Build plan + log as 'pending'
-          11. Dispatch Discord alert (includes queue badge)
-          12. Return — queue executes after delay_seconds
+        Block order (critical):
+          1. Cooldown skip
+          2. Multi-TF fetch
+          3. Indicators + derivatives          ← must precede guard
+          4. Momentum guard + ATR filter       ← uses `indicators`
+          5. Composite quant engine
+          6. SMC + Fibonacci + heatmap
+          7. Agreement gate
+          8. Preliminary confidence
+          9. DeepSeek
+          10. Final confidence + LLM check
+          11. Setup classification + SL/TP populate
+          12. Build plan, log as 'pending'
+          13. Dispatch Discord alerts
+          14. Return — queue executes after delay
         """
         # ============================================================ #
-        # 1. Early skip (cooldown / active position / pending entry)
+        # 1. Early cooldown skip
         # ============================================================ #
         skip_reason = self._should_skip_symbol(symbol)
         if skip_reason:
@@ -681,7 +680,21 @@ class QuantBotV9:
         df_15m, df_1h, df_4h = await self._fetch_multi_tf(symbol)
         if df_1h is None or len(df_1h) < 100:
             return
-        # ---- Momentum guard: skip if price already moving too fast ----
+
+        # ============================================================ #
+        # 3. Core analysis — indicators & derivatives FIRST
+        #    Both are needed by the momentum guard and by everything
+        #    downstream, so they run before any skip logic that reads
+        #    from them.
+        # ============================================================ #
+        indicators = self._compute_indicators(df_1h)
+        deriv = await self.derivatives.get_full_snapshot(symbol)
+
+        # ============================================================ #
+        # 4a. Momentum guard — skip if already moving too fast
+        #     5-bar ROC on 1h klines = 5h rate of change.
+        #     Prevents queuing signals that are already extended.
+        # ============================================================ #
         momentum_cfg = self.config.get("execution", {})
         roc_threshold = float(
             momentum_cfg.get("momentum_guard_roc_pct", 3.0)
@@ -696,7 +709,9 @@ class QuantBotV9:
                 current_close = float(closes[-1])
                 past_close = float(closes[-(roc_lookback + 1)])
                 if past_close > 0:
-                    roc_pct = (current_close - past_close) / past_close * 100
+                    roc_pct = (
+                        (current_close - past_close) / past_close * 100
+                    )
                     if abs(roc_pct) >= roc_threshold:
                         logger.info(
                             f"{symbol}: momentum guard — "
@@ -706,54 +721,60 @@ class QuantBotV9:
                         await self._log_rejected(
                             symbol=symbol,
                             bias="neutral",
-                            indicators={},
-                            deriv=None,
+                            indicators=indicators,
+                            deriv=deriv,
                             composite=None,
                             agreement=None,
                             price=current_close,
-                            extra_gate=f"momentum_exhausted:{roc_pct:+.2f}%",
+                            extra_gate=(
+                                f"momentum_exhausted:{roc_pct:+.2f}%"
+                            ),
                         )
                         return
             except Exception as e:
-                logger.debug(f"Momentum guard failed for {symbol}: {e}")
-
-        # ---- Volatility filter (ATR%) ----
-        atr_pct = indicators.get("atr", 0.0)
-        if df_1h is not None and len(df_1h) > 0:
-            price_now = float(df_1h["close"].iloc[-1])
-            if price_now > 0 and atr_pct > 0:
-                atr_pct_val = atr_pct / price_now * 100
-                min_atr = float(momentum_cfg.get("min_atr_pct", 0.3))
-                max_atr = float(momentum_cfg.get("max_atr_pct", 5.0))
-                if atr_pct_val < min_atr:
-                    logger.debug(
-                        f"{symbol}: ATR%={atr_pct_val:.2f}% < "
-                        f"min {min_atr}% — skipping (too quiet)"
-                    )
-                    return
-                if atr_pct_val > max_atr:
-                    logger.info(
-                        f"{symbol}: ATR%={atr_pct_val:.2f}% > "
-                        f"max {max_atr}% — skipping (too volatile)"
-                    )
-                    await self._log_rejected(
-                        symbol=symbol,
-                        bias="neutral",
-                        indicators=indicators,
-                        deriv=deriv,
-                        composite=None,
-                        agreement=None,
-                        price=price_now,
-                        extra_gate=f"atr_too_high:{atr_pct_val:.2f}%",
-                    )
-                    return
+                logger.debug(
+                    f"Momentum guard failed for {symbol}: {e}"
+                )
 
         # ============================================================ #
-        # 3. Core analysis
+        # 4b. Volatility filter — ATR% band
+        #     Below min_atr_pct = dead symbol (no edge).
+        #     Above max_atr_pct = pump-mode memecoin (no stop-loss).
         # ============================================================ #
-        indicators = self._compute_indicators(df_1h)
-        deriv = await self.derivatives.get_full_snapshot(symbol)
+        atr_val = float(indicators.get("atr", 0.0))
+        price_now = float(df_1h["close"].iloc[-1])
+        if price_now > 0 and atr_val > 0:
+            atr_pct_val = atr_val / price_now * 100
+            min_atr = float(momentum_cfg.get("min_atr_pct", 0.3))
+            max_atr = float(momentum_cfg.get("max_atr_pct", 5.0))
 
+            if atr_pct_val < min_atr:
+                logger.debug(
+                    f"{symbol}: ATR%={atr_pct_val:.2f}% < "
+                    f"min {min_atr}% — skipping (too quiet)"
+                )
+                return
+
+            if atr_pct_val > max_atr:
+                logger.info(
+                    f"{symbol}: ATR%={atr_pct_val:.2f}% > "
+                    f"max {max_atr}% — skipping (too volatile)"
+                )
+                await self._log_rejected(
+                    symbol=symbol,
+                    bias="neutral",
+                    indicators=indicators,
+                    deriv=deriv,
+                    composite=None,
+                    agreement=None,
+                    price=price_now,
+                    extra_gate=f"atr_too_high:{atr_pct_val:.2f}%",
+                )
+                return
+
+        # ============================================================ #
+        # 5. Composite quant engine
+        # ============================================================ #
         composite = await self.composite_engine.compute(
             symbol=symbol,
             df=df_1h,
@@ -776,7 +797,7 @@ class QuantBotV9:
         current_price = float(df_1h["close"].iloc[-1])
 
         # ============================================================ #
-        # 4. SMC / Fibonacci / Heatmap (parallel)
+        # 6. SMC + Fibonacci + orderbook heatmap (parallel-safe)
         # ============================================================ #
         try:
             smc = self.smc_analyzer.analyze(df_1h)
@@ -798,7 +819,7 @@ class QuantBotV9:
             heatmap = None
 
         # ============================================================ #
-        # 5. Directional contributions for agreement gate
+        # 7. Directional contributions for agreement gate
         # ============================================================ #
         smc_dir = "neutral"
         if smc is not None:
@@ -852,7 +873,7 @@ class QuantBotV9:
             return
 
         # ============================================================ #
-        # 6. Preliminary confidence (no LLM)
+        # 8. Preliminary confidence (no LLM)
         # ============================================================ #
         prelim = self.scorer.compute(
             symbol=symbol,
@@ -880,7 +901,7 @@ class QuantBotV9:
             return
 
         # ============================================================ #
-        # 7. DeepSeek analysis
+        # 9. DeepSeek
         # ============================================================ #
         market_context = {
             "symbol": symbol,
@@ -932,7 +953,7 @@ class QuantBotV9:
         llm_response = await self.agent.analyse(symbol, market_context)
 
         # ============================================================ #
-        # 8. Final confidence + LLM agreement check
+        # 10. Final confidence + LLM agreement check
         # ============================================================ #
         final = self.scorer.compute(
             symbol=symbol,
@@ -963,7 +984,9 @@ class QuantBotV9:
                 agreement=agreement,
                 prelim=final,
                 price=current_price,
-                extra_gate=f"llm_mismatch:{llm_dir}!={agreement.direction}",
+                extra_gate=(
+                    f"llm_mismatch:{llm_dir}!={agreement.direction}"
+                ),
             )
             return
 
@@ -987,7 +1010,7 @@ class QuantBotV9:
             return
 
         # ============================================================ #
-        # 9. Setup classification
+        # 11. Setup classification
         # ============================================================ #
         setups = self.setup_classifier.classify_all(
             df_15m=df_15m,
@@ -997,7 +1020,8 @@ class QuantBotV9:
             deriv=deriv,
             bias=bias,
         )
-        # Populate SL/TP on each setup using the configured R-multiples
+
+        # Populate SL/TP on each valid setup
         for setup in setups.valid_setups:
             try:
                 entry_mid = (
@@ -1020,11 +1044,6 @@ class QuantBotV9:
 
         if setups.count == 0:
             logger.debug(f"{symbol}: no valid setups")
-            # ... rest of the rejection block unchanged
-            return
-
-        if setups.count == 0:
-            logger.debug(f"{symbol}: no valid setups")
             await self._log_rejected(
                 symbol=symbol,
                 bias=bias,
@@ -1043,15 +1062,13 @@ class QuantBotV9:
             return
 
         # ============================================================ #
-        # 10. Entry price — use Fibonacci zone when applicable
+        # 12. Entry price — Fibonacci zone when applicable
         # ============================================================ #
         entry = current_price
         if fibo is not None and fibo.valid:
             if fibo.entry_zone_low <= current_price <= fibo.entry_zone_high:
-                # Inside zone — use current
                 entry = current_price
             else:
-                # Outside zone — use near edge as limit
                 entry = (
                     fibo.entry_zone_low
                     if bias == "long"
@@ -1059,7 +1076,8 @@ class QuantBotV9:
                 )
             logger.debug(
                 f"{symbol}: fib entry={entry:.6f} "
-                f"(zone {fibo.entry_zone_low:.6f}-{fibo.entry_zone_high:.6f}, "
+                f"(zone {fibo.entry_zone_low:.6f}-"
+                f"{fibo.entry_zone_high:.6f}, "
                 f"current={current_price:.6f})"
             )
 
@@ -1081,7 +1099,7 @@ class QuantBotV9:
                 "tp_weights", [0.40, 0.35, 0.25]
             )),
             confidence=final.calibrated_confidence,
-            leverage=self.config["risk"].get("default_leverage", 5),
+            leverage=self.config["risk"].get("default_leverage", 10),
             reason=(
                 f"Setup={best.setup_type} "
                 f"Raw={final.raw_total:.0f} "
@@ -1098,14 +1116,18 @@ class QuantBotV9:
                 "heatmap_dir": heatmap_dir,
                 "fibo_zone": fibo.zone_name if fibo else "",
                 "fibo_in_zone": fibo_in_zone,
-                "funding_block_long": composite.funding.should_block_long,
-                "funding_block_short": composite.funding.should_block_short,
+                "funding_block_long": (
+                    composite.funding.should_block_long
+                ),
+                "funding_block_short": (
+                    composite.funding.should_block_short
+                ),
                 "funding_rate_pct": composite.funding.rate_pct,
             },
         )
 
         # ============================================================ #
-        # 11. Late skip check — mid-analysis race
+        # 13. Late skip — mid-analysis race
         # ============================================================ #
         skip_reason = self._should_skip_symbol(symbol)
         if skip_reason:
@@ -1115,12 +1137,11 @@ class QuantBotV9:
             return
 
         # ============================================================ #
-        # 12. Build plan for queue
+        # 14. Build plan (per-setup delay)
         # ============================================================ #
-                # Per-setup delay: scalp gets shorter delay, swing gets longer
         delay_cfg = self.config.get("auto_trade", {})
         delay_by_setup = delay_cfg.get("delay_seconds_by_setup", {})
-        default_delay = int(delay_cfg.get("delay_seconds", 10))
+        default_delay = int(delay_cfg.get("delay_seconds", 30))
         delay_seconds = int(
             delay_by_setup.get(best.setup_type, default_delay)
         )
@@ -1154,7 +1175,7 @@ class QuantBotV9:
         }
 
         # ============================================================ #
-        # 13. Log as 'pending' — queue executes later
+        # 15. Log signal as 'pending'
         # ============================================================ #
         signal_dict = {
             "symbol": symbol,
@@ -1209,7 +1230,7 @@ class QuantBotV9:
             return
 
         # ============================================================ #
-        # 14. Dispatch Discord alerts
+        # 16. Dispatch Discord alerts
         # ============================================================ #
         await self._dispatch_multi_setup_alerts(
             symbol=symbol,
@@ -1229,7 +1250,7 @@ class QuantBotV9:
         )
 
         # ============================================================ #
-        # 15. Log queue status — queue handles execution
+        # 17. Log queue status — SignalQueue handles execution
         # ============================================================ #
         auto_trade_state = (
             "on" if self.signal_queue.cfg.enabled else "off"
