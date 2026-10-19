@@ -15,23 +15,15 @@ class SignalJournal:
     def __init__(self, db):
         self.db = db
 
+    # ================================================================== #
+    #  Write
+    # ================================================================== #
     async def log_signal(
         self,
         signal: Dict,
         plan: Optional[Dict] = None,
         execution_status: Optional[str] = None,
     ) -> int:
-        """
-        Insert a signal into the signals table.
-
-        Args:
-            signal: signal dict (symbol, direction, entry_price, etc.)
-            plan: optional execution plan (SL, TPs, tp_weights, leverage,
-                  delay_seconds, etc.). When provided, the row is marked
-                  'pending' and picked up by the SignalQueue worker.
-            execution_status: override status. Defaults to 'pending' if
-                              plan provided, else 'skipped'.
-        """
         try:
             return await self._log_signal_inner(
                 signal,
@@ -53,11 +45,9 @@ class SignalJournal:
     ) -> int:
         breakdown = signal.get("_breakdown") or {}
 
-        # Auto-determine status if caller didn't provide one
         if execution_status is None:
             execution_status = "pending" if plan is not None else "skipped"
 
-        # Compute execute_after timestamp
         execute_after = None
         if plan is not None:
             delay = int(plan.get("delay_seconds", 30))
@@ -121,7 +111,8 @@ class SignalJournal:
 
     async def mark_executed(self, signal_id: int, result: Dict):
         await self.db.execute(
-            "UPDATE signals SET executed = TRUE, execution_result = $1 WHERE id = $2",
+            "UPDATE signals SET executed = TRUE, "
+            "execution_result = $1 WHERE id = $2",
             json.dumps(result, default=str), signal_id,
         )
 
@@ -147,8 +138,10 @@ class SignalJournal:
             datetime.fromisoformat(outcome["resolved_at"]),
         )
 
+    # ================================================================== #
+    #  Read (sync wrappers for auto-tuner)
+    # ================================================================== #
     def get_signals_since(self, cutoff: datetime) -> List[Dict]:
-        import asyncio
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -157,17 +150,19 @@ class SignalJournal:
 
         async def _run():
             rows = await self.db.fetch(
-                "SELECT * FROM signals WHERE timestamp >= $1 ORDER BY timestamp",
+                "SELECT * FROM signals WHERE timestamp >= $1 "
+                "ORDER BY timestamp",
                 cutoff,
             )
             return [dict(r) for r in rows]
 
         if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(_run(), loop).result()
+            return asyncio.run_coroutine_threadsafe(
+                _run(), loop,
+            ).result()
         return loop.run_until_complete(_run())
 
     def get_outcome(self, signal_id: int) -> Optional[Dict]:
-        import asyncio
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -176,16 +171,23 @@ class SignalJournal:
 
         async def _run():
             row = await self.db.fetchrow(
-                "SELECT * FROM outcomes WHERE signal_id = $1", signal_id,
+                "SELECT * FROM outcomes WHERE signal_id = $1",
+                signal_id,
             )
             return dict(row) if row else None
 
         if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(_run(), loop).result()
+            return asyncio.run_coroutine_threadsafe(
+                _run(), loop,
+            ).result()
         return loop.run_until_complete(_run())
 
     def get_unresolved_signals(self) -> List[Dict]:
-        import asyncio
+        """
+        Fix C: exclude stalled / cancelled / expired / failed / skipped.
+        These will never produce an outcome (no position was opened),
+        so retrying resolution wastes tuner cycles each morning.
+        """
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -198,6 +200,10 @@ class SignalJournal:
                 SELECT s.* FROM signals s
                 LEFT JOIN outcomes o ON o.signal_id = s.id
                 WHERE o.signal_id IS NULL
+                  AND s.execution_status NOT IN (
+                    'stalled', 'cancelled', 'expired',
+                    'failed', 'skipped'
+                  )
                   AND s.timestamp >= NOW() - INTERVAL '7 days'
                 ORDER BY s.timestamp
                 """
@@ -205,5 +211,7 @@ class SignalJournal:
             return [dict(r) for r in rows]
 
         if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(_run(), loop).result()
+            return asyncio.run_coroutine_threadsafe(
+                _run(), loop,
+            ).result()
         return loop.run_until_complete(_run())

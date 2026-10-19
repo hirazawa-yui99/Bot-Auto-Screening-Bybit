@@ -122,6 +122,7 @@ class QuantBotV9:
             self.risk_manager,
             self.config["execution"],
             on_position_closed=self._on_position_closed,
+            on_limit_stalled=self._on_limit_stalled,
         )
 
         # ---- Learning ----
@@ -166,6 +167,116 @@ class QuantBotV9:
             on_filled=self._on_trade_filled,
         )
     
+    async def _on_limit_stalled(self, signal, result: Dict):
+        """
+        Called by TradeExecutor when a limit entry stalls.
+        Updates DB, releases the queue symbol, and notifies Discord.
+        """
+        sig_id = int((signal.metadata or {}).get("signal_id", 0))
+        setup_type = str(
+            (signal.metadata or {}).get("setup_type", "")
+        ).lower()
+
+        elapsed_sec = int(result.get("elapsed_sec", 0))
+        elapsed_min = elapsed_sec // 60
+        candles = float(result.get("candles", 0))
+        stall_sec = int(result.get("stall_timeout_sec", 0))
+        stall_timeout_min = stall_sec // 60
+
+        # ---- 1. Release queue symbol (Fix B) ----
+        try:
+            self.signal_queue.release_symbol(signal.symbol)
+        except Exception as e:
+            logger.debug(f"release_symbol error: {e}")
+
+        # ---- 2. Optional post-stall cooldown (Fix D) ----
+        stall_cooldown_min = int(
+            self.config.get("execution", {}).get(
+                "stall_cooldown_minutes", 0,
+            )
+        )
+        if stall_cooldown_min > 0 and self._signal_cooldown_hours > 0:
+            self._alerted_signals[signal.symbol] = {
+                "timestamp": datetime.utcnow()
+                - timedelta(
+                    hours=max(
+                        0.0,
+                        self._signal_cooldown_hours
+                        - stall_cooldown_min / 60.0,
+                    )
+                ),
+                "direction": signal.direction,
+                "confidence": 0.0,
+                "signal_id": sig_id,
+                "reason": "stalled",
+            }
+            logger.info(
+                f"{signal.symbol}: {stall_cooldown_min}min cooldown "
+                f"after stall"
+            )
+
+        # ---- 3. DB update ----
+        if sig_id > 0:
+            try:
+                await self.db.execute(
+                    """
+                    UPDATE signals
+                    SET execution_status = 'stalled',
+                        execution_result = $1,
+                        executed_at = NOW()
+                    WHERE id = $2
+                    """,
+                    json.dumps({
+                        "reason": "limit_stalled",
+                        "elapsed_sec": elapsed_sec,
+                        "elapsed_min": elapsed_min,
+                        "candles": candles,
+                        "stall_timeout_sec": stall_sec,
+                        "setup_type": setup_type,
+                    }),
+                    sig_id,
+                )
+                logger.info(
+                    f"Signal {sig_id} {signal.symbol} "
+                    f"marked 'stalled' in DB "
+                    f"({candles:.1f} candles, {elapsed_min} min)"
+                )
+            except Exception as e:
+                logger.error(
+                    f"mark-stalled DB update failed for {sig_id}: {e}"
+                )
+
+        # ---- 4. Discord notification ----
+        stall_notify = bool(
+            self.config.get("execution", {}).get(
+                "stall_notify_discord", True,
+            )
+        )
+        if not stall_notify:
+            logger.debug(
+                f"Stall notify disabled — not sending Discord for "
+                f"{signal.symbol}"
+            )
+            return
+
+        try:
+            await self.notifier.send_limit_stalled(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                entry=float(signal.entry_price),
+                elapsed_min=elapsed_min,
+                candles=candles,
+                signal_id=sig_id,
+                setup_type=setup_type,
+                stall_timeout_min=stall_timeout_min,
+            )
+            logger.info(
+                f"Stalled alert sent to Discord for {signal.symbol}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Stalled Discord alert failed for {signal.symbol}: {e}"
+            )
     async def _fetch_multi_tf(self, symbol: str) -> Tuple[
         Optional[pd.DataFrame], pd.DataFrame, Optional[pd.DataFrame],
     ]:

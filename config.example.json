@@ -105,9 +105,17 @@
     "market_tolerance_pct": 0.15,
     "max_deviation_pct": 3.0,
     "cancel_on_rally_pct": 1.5,
-    "limit_order_expiry_minutes": 30,
-    "limit_check_interval_sec": 20,
 
+    "limit_order_expiry_minutes": 1440,
+    "limit_check_interval_sec": 20,
+    "stall_timeout_candles": 8,
+    "stall_candle_seconds_by_setup": {
+        "scalp": 900,
+        "intraday": 3600,
+        "swing": 14400
+    },
+    "stall_notify_discord": true,
+    "stall_cooldown_minutes": 0,
     "tp_mode": "r_multiple",
     "atr_multiplier_sl": 1.5,
     "tp_r_multiples": [1.0, 2.0, 3.0],

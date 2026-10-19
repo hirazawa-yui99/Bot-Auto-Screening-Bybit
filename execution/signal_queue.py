@@ -13,11 +13,12 @@ Modes:
 
 States:
   pending    → waiting for execute_after
-  executing  → order placed, awaiting fill
+  executing  → order placed, awaiting fill (limit case)
   filled     → position opened
   skipped    → rejected by risk/cooldown at exec time
   failed     → execution error
   expired    → execute_after passed but not executed within expiry window
+  stalled    → limit placed but not filled within stall timeout
 """
 import asyncio
 import json
@@ -70,6 +71,15 @@ class SignalQueue:
     def is_pending(self, symbol: str) -> bool:
         """Called by _should_skip_symbol to detect in-flight executions."""
         return symbol in self._pending_symbols
+
+    def release_symbol(self, symbol: str):
+        """
+        Called when a background limit resolves (filled, stalled,
+        rallied, expired). Removes from _pending_symbols so the
+        symbol is eligible for new signals.
+        """
+        self._pending_symbols.discard(symbol)
+        logger.debug(f"Queue released symbol {symbol}")
 
     def update_config(self, new_cfg: Dict):
         """Called during soft reload."""
@@ -161,6 +171,11 @@ class SignalQueue:
         sig_id = sig["id"]
         symbol = sig["symbol"]
         self._pending_symbols.add(symbol)
+
+        # Tracks whether we hand off to the executor's background tracker.
+        # If True, we KEEP the symbol in _pending_symbols until
+        # on_limit_stalled / on_filled / rally-cancel fires.
+        handed_off = False
 
         try:
             # Expiry check
@@ -274,13 +289,14 @@ class SignalQueue:
                         )
 
             elif status == "pending_limit":
-                # Limit placed; executor monitors fill.
-                await self._mark_status(
-                    sig_id, "executing", result,
-                )
+                # Executor spawned a background tracker. Keep the
+                # symbol locked so _should_skip_symbol rejects new
+                # signals until the limit resolves (fill/stall/rally).
+                await self._mark_status(sig_id, "executing", result)
+                handed_off = True
                 logger.info(
                     f"Signal {sig_id} {symbol} → LIMIT PLACED, "
-                    f"awaiting fill"
+                    f"awaiting fill/stall"
                 )
 
             else:
@@ -296,7 +312,8 @@ class SignalQueue:
                 )
 
         finally:
-            self._pending_symbols.discard(symbol)
+            if not handed_off:
+                self._pending_symbols.discard(symbol)
 
     async def _mark_status(self, sig_id: int, status: str, result: Dict):
         try:
