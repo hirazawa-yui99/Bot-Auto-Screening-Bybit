@@ -681,6 +681,72 @@ class QuantBotV9:
         df_15m, df_1h, df_4h = await self._fetch_multi_tf(symbol)
         if df_1h is None or len(df_1h) < 100:
             return
+        # ---- Momentum guard: skip if price already moving too fast ----
+        momentum_cfg = self.config.get("execution", {})
+        roc_threshold = float(
+            momentum_cfg.get("momentum_guard_roc_pct", 3.0)
+        )
+        roc_lookback = int(
+            momentum_cfg.get("momentum_guard_lookback_bars", 5)
+        )
+
+        if roc_threshold > 0 and len(df_1h) > roc_lookback + 2:
+            try:
+                closes = df_1h["close"].values
+                current_close = float(closes[-1])
+                past_close = float(closes[-(roc_lookback + 1)])
+                if past_close > 0:
+                    roc_pct = (current_close - past_close) / past_close * 100
+                    if abs(roc_pct) >= roc_threshold:
+                        logger.info(
+                            f"{symbol}: momentum guard — "
+                            f"{roc_lookback}h ROC={roc_pct:+.2f}% "
+                            f"≥ {roc_threshold}%, skipping"
+                        )
+                        await self._log_rejected(
+                            symbol=symbol,
+                            bias="neutral",
+                            indicators={},
+                            deriv=None,
+                            composite=None,
+                            agreement=None,
+                            price=current_close,
+                            extra_gate=f"momentum_exhausted:{roc_pct:+.2f}%",
+                        )
+                        return
+            except Exception as e:
+                logger.debug(f"Momentum guard failed for {symbol}: {e}")
+
+        # ---- Volatility filter (ATR%) ----
+        atr_pct = indicators.get("atr", 0.0)
+        if df_1h is not None and len(df_1h) > 0:
+            price_now = float(df_1h["close"].iloc[-1])
+            if price_now > 0 and atr_pct > 0:
+                atr_pct_val = atr_pct / price_now * 100
+                min_atr = float(momentum_cfg.get("min_atr_pct", 0.3))
+                max_atr = float(momentum_cfg.get("max_atr_pct", 5.0))
+                if atr_pct_val < min_atr:
+                    logger.debug(
+                        f"{symbol}: ATR%={atr_pct_val:.2f}% < "
+                        f"min {min_atr}% — skipping (too quiet)"
+                    )
+                    return
+                if atr_pct_val > max_atr:
+                    logger.info(
+                        f"{symbol}: ATR%={atr_pct_val:.2f}% > "
+                        f"max {max_atr}% — skipping (too volatile)"
+                    )
+                    await self._log_rejected(
+                        symbol=symbol,
+                        bias="neutral",
+                        indicators=indicators,
+                        deriv=deriv,
+                        composite=None,
+                        agreement=None,
+                        price=price_now,
+                        extra_gate=f"atr_too_high:{atr_pct_val:.2f}%",
+                    )
+                    return
 
         # ============================================================ #
         # 3. Core analysis
@@ -1051,10 +1117,12 @@ class QuantBotV9:
         # ============================================================ #
         # 12. Build plan for queue
         # ============================================================ #
+                # Per-setup delay: scalp gets shorter delay, swing gets longer
+        delay_cfg = self.config.get("auto_trade", {})
+        delay_by_setup = delay_cfg.get("delay_seconds_by_setup", {})
+        default_delay = int(delay_cfg.get("delay_seconds", 10))
         delay_seconds = int(
-            self.config.get("auto_trade", {}).get(
-                "delay_seconds", 30,
-            )
+            delay_by_setup.get(best.setup_type, default_delay)
         )
 
         plan = {
