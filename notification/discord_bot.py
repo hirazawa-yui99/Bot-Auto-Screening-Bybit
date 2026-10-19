@@ -446,7 +446,9 @@ class DiscordNotifier:
         self, signal, breakdown, llm_response: Dict,
         chart_path: Optional[str] = None,
         composite=None, deriv=None, indicators: Optional[Dict] = None,
-        setup_label: Optional[str] = None,      # NEW
+        setup_label: Optional[str] = None,
+        signal_id: int = 0,           # ← must be present
+        delay_seconds: int = 0,       # ← must be present
     ):
         """Send signal alert (and quant breakdown if data provided)."""
         title_prefix = f"[{setup_label.upper()}] " if setup_label else ""
@@ -469,6 +471,170 @@ class DiscordNotifier:
             channel="live",
             alert_embed=alert_embed,
             quant_embed=quant_embed,
+            file_path=chart_path,
+        )
+
+    async def send_multi_setup_alert(
+        self,
+        symbol: str,
+        setups: list,
+        breakdown,
+        llm_response: Dict,
+        chart_path: Optional[str] = None,
+        composite=None,
+        deriv=None,
+        indicators: Optional[Dict] = None,
+        agreement=None,
+        smc=None,
+        fibo=None,
+        heatmap=None,
+        signal_id: int = 0,
+        delay_seconds: int = 0,
+    ):
+        """
+        Send a combined message covering 1–2 setups, or one of three
+        separate messages when the caller iterates 3 setups.
+        """
+        if not setups:
+            return
+
+        labels = [s.setup_type.upper() for s in setups]
+        title_label = " + ".join(labels)
+
+        # Direction color
+        first_dir = getattr(setups[0], "direction", "neutral")
+        if first_dir == "long":
+            color = 0x3BA55D
+        elif first_dir == "short":
+            color = 0xED4245
+        else:
+            color = 0x5865F2
+
+        fields = []
+
+        # One field per setup
+        for s in setups:
+            entry_mid = (
+                getattr(s, "entry_zone_low", 0.0)
+                + getattr(s, "entry_zone_high", 0.0)
+            ) / 2
+            fields.append({
+                "name": f"📐 {s.setup_type.upper()} ({s.timeframe})",
+                "value": (
+                    f"Direction: **{s.direction.upper()}**\n"
+                    f"Confidence: **{s.confidence:.0%}**\n"
+                    f"Entry: `{entry_mid:.6f}` "
+                    f"(zone `{s.entry_zone_low:.6f}`–`{s.entry_zone_high:.6f}`)\n"
+                    f"ATR: `{s.atr:.6f}`\n"
+                    f"Reason: {s.reason}"
+                ),
+                "inline": False,
+            })
+
+        # Agreement summary
+        if agreement is not None:
+            details_str = ", ".join(
+                f"{k}={v}" for k, v in agreement.details.items()
+                if v != "neutral"
+            ) or "all neutral"
+            fields.append({
+                "name": "🔒 Agreement",
+                "value": (
+                    f"Direction: **{agreement.direction.upper()}**\n"
+                    f"Signals: {agreement.agreement_count} agree "
+                    f"({details_str})"
+                ),
+                "inline": False,
+            })
+
+        # Fib zone
+        if fibo is not None and getattr(fibo, "valid", False):
+            fields.append({
+                "name": "📊 Fibonacci",
+                "value": (
+                    f"Zone: {fibo.zone_name}\n"
+                    f"Range: `{fibo.entry_zone_low:.6f}` – "
+                    f"`{fibo.entry_zone_high:.6f}`\n"
+                    f"In zone: {'✅' if fibo.in_zone else '❌'}"
+                ),
+                "inline": True,
+            })
+
+        # Heatmap
+        if heatmap is not None and getattr(heatmap, "valid", False):
+            fields.append({
+                "name": "🔥 Heatmap",
+                "value": (
+                    f"Imbalance: **{heatmap.imbalance:+.2f}**\n"
+                    f"Direction: {heatmap.direction}\n"
+                    f"Strength: {'strong' if heatmap.strength or heatmap.strong else 'mild'}"
+                ),
+                "inline": True,
+            })
+
+        # SMC
+        if smc is not None:
+            fields.append({
+                "name": "🧱 SMC",
+                "value": (
+                    f"BOS: {getattr(smc, 'bos', 'none')}\n"
+                    f"CHoCH: {getattr(smc, 'choch', 'none')}\n"
+                    f"Sweep: {getattr(smc, 'liquidity_sweep', 'none')}"
+                ),
+                "inline": True,
+            })
+
+        # Queue status
+        if signal_id > 0:
+            mode = "auto-trade ON" if delay_seconds > 0 else "observation"
+            fields.append({
+                "name": "⏱ Queue",
+                "value": (
+                    f"Signal `#{signal_id}` · {mode}\n"
+                    + (
+                        f"Executes in **{delay_seconds}s**"
+                        if delay_seconds > 0 else "No auto-execution"
+                    )
+                ),
+                "inline": False,
+            })
+
+        # Confidence summary
+        if breakdown is not None:
+            fields.append({
+                "name": "📊 Confidence",
+                "value": (
+                    f"Raw: **{breakdown.raw_total:.1f}**/100\n"
+                    f"Calibrated: **{breakdown.calibrated_confidence:.1%}**"
+                ),
+                "inline": True,
+            })
+
+        embed = {
+            "title": (
+                f"{'🟢' if first_dir == 'long' else '🔴' if first_dir == 'short' else '⚪'} "
+                f"{title_label} SETUP · {symbol}"
+            ),
+            "color": color,
+            "fields": fields,
+            "footer": {
+                "text": (
+                    "Bybit Quant v9.2 · "
+                    f"{datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                )
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        if chart_path:
+            embed["image"] = {
+                "url": "attachment://" + os.path.basename(chart_path)
+            }
+
+        await self._dispatch_embeds(
+            channel="live",
+            alert_embed=embed,
+            quant_embed=None,
             file_path=chart_path,
         )
 
