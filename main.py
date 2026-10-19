@@ -194,7 +194,7 @@ class QuantBotV9:
     async def _on_position_closed(
         self, symbol, pos, pnl_pct, filled_tps, exit_reason,
     ):
-        """Called by executor when a position closes — sends Discord alert."""
+        """Called by TradeExecutor when a position closes."""
         chart_path = None
         try:
             klines = await self.client.get_klines(
@@ -259,6 +259,7 @@ class QuantBotV9:
                     os.unlink(chart_path)
                 except Exception:
                     pass
+    
     def _should_skip_symbol(self, symbol: str) -> Optional[str]:
         """
         Return a reason string if the symbol should be skipped, else None.
@@ -526,17 +527,41 @@ class QuantBotV9:
     #  Per-symbol analysis pipeline
     # ================================================================== #
     async def _analyse_and_signal(self, symbol: str):
-        # 1. Cooldown check
+        """
+        Full analysis pipeline for a single symbol.
+
+        Flow:
+          1. Cooldown check          → skip if recently alerted
+          2. Multi-TF fetch (15m/1h/4h)
+          3. Indicators + derivatives + composite
+          4. SMC + Fibonacci + orderbook heatmap
+          5. Agreement gate          → skip if contradiction
+          6. Preliminary confidence  → skip if raw < 40
+          7. DeepSeek analysis
+          8. Final confidence + LLM agreement check
+          9. Setup classification    → skip if 0 setups
+          10. Build plan + log as 'pending'
+          11. Dispatch Discord alert (includes queue badge)
+          12. Return — queue executes after delay_seconds
+        """
+        # ============================================================ #
+        # 1. Early skip (cooldown / active position / pending entry)
+        # ============================================================ #
         skip_reason = self._should_skip_symbol(symbol)
         if skip_reason:
             logger.debug(f"{symbol}: skipping — {skip_reason}")
             return
 
-        # 2. Multi-timeframe data
+        # ============================================================ #
+        # 2. Multi-timeframe fetch
+        # ============================================================ #
         df_15m, df_1h, df_4h = await self._fetch_multi_tf(symbol)
         if df_1h is None or len(df_1h) < 100:
             return
 
+        # ============================================================ #
+        # 3. Core analysis
+        # ============================================================ #
         indicators = self._compute_indicators(df_1h)
         deriv = await self.derivatives.get_full_snapshot(symbol)
 
@@ -559,8 +584,11 @@ class QuantBotV9:
         )
 
         patterns = self._detect_patterns(df_1h)
+        current_price = float(df_1h["close"].iloc[-1])
 
-        # 3. SMC, fibo, orderbook heatmap — run in parallel
+        # ============================================================ #
+        # 4. SMC / Fibonacci / Heatmap (parallel)
+        # ============================================================ #
         try:
             smc = self.smc_analyzer.analyze(df_1h)
         except Exception as e:
@@ -580,39 +608,43 @@ class QuantBotV9:
             logger.debug(f"Heatmap failed for {symbol}: {e}")
             heatmap = None
 
-        # 4. Directional contributions for the agreement gate
+        # ============================================================ #
+        # 5. Directional contributions for agreement gate
+        # ============================================================ #
         smc_dir = "neutral"
-        if smc is not None and smc.bos == "bullish":
-            smc_dir = "long"
-        elif smc is not None and smc.bos == "bearish":
-            smc_dir = "short"
-        elif smc is not None and smc.choch == "bullish":
-            smc_dir = "long"
-        elif smc is not None and smc.choch == "bearish":
-            smc_dir = "short"
+        if smc is not None:
+            if smc.bos in ("bullish", "bearish"):
+                smc_dir = "long" if smc.bos == "bullish" else "short"
+            elif smc.choch in ("bullish", "bearish"):
+                smc_dir = "long" if smc.choch == "bullish" else "short"
 
         deriv_dir = "neutral"
-        if deriv.cvd_divergence == "bullish" or deriv.smart_money_bias == "long":
+        if (
+            deriv.cvd_divergence == "bullish"
+            or deriv.smart_money_bias == "long"
+        ):
             deriv_dir = "long"
-        elif deriv.cvd_divergence == "bearish" or deriv.smart_money_bias == "short":
+        elif (
+            deriv.cvd_divergence == "bearish"
+            or deriv.smart_money_bias == "short"
+        ):
             deriv_dir = "short"
 
         heatmap_dir = heatmap.direction if heatmap else "neutral"
 
         fibo_dir = "neutral"
-        fibo_valid = False
+        fibo_in_zone = False
         if fibo is not None and fibo.valid:
-            fibo_valid = True
-            fibo_dir = bias  # fib is directional only when in_zone and price on correct side
+            fibo_dir = bias
+            fibo_in_zone = fibo.in_zone
 
-        # 5. Strict agreement gate
         agreement = self.agreement_gate.check(
             smc_dir=smc_dir,
             deriv_dir=deriv_dir,
             quant_dir=composite.direction,
             heatmap_dir=heatmap_dir,
             fib_direction=fibo_dir,
-            fib_valid=fibo_valid and fibo.in_zone if fibo else False,
+            fib_valid=fibo_in_zone,
         )
 
         if not agreement.passed:
@@ -620,11 +652,19 @@ class QuantBotV9:
                 f"{symbol}: agreement gate failed — {agreement.reason}"
             )
             await self._log_rejected(
-                symbol, bias, indicators, deriv, composite, agreement,
+                symbol=symbol,
+                bias=bias,
+                indicators=indicators,
+                deriv=deriv,
+                composite=composite,
+                agreement=agreement,
+                price=current_price,
             )
             return
 
-        # 6. Preliminary confidence
+        # ============================================================ #
+        # 6. Preliminary confidence (no LLM)
+        # ============================================================ #
         prelim = self.scorer.compute(
             symbol=symbol,
             klines_df=df_1h,
@@ -634,19 +674,28 @@ class QuantBotV9:
             bias=bias,
             llm_response=None,
             composite=composite,
-            funding_result=composite.funding
+            funding_result=composite.funding,
         )
+
         if prelim.raw_total < 40:
             await self._log_rejected(
-                symbol, bias, indicators, deriv, composite, agreement,
+                symbol=symbol,
+                bias=bias,
+                indicators=indicators,
+                deriv=deriv,
+                composite=composite,
+                agreement=agreement,
                 prelim=prelim,
+                price=current_price,
             )
             return
 
-        # 7. DeepSeek
+        # ============================================================ #
+        # 7. DeepSeek analysis
+        # ============================================================ #
         market_context = {
             "symbol": symbol,
-            "price": float(df_1h["close"].iloc[-1]),
+            "price": current_price,
             "bias": bias,
             "indicators": indicators,
             "derivatives": {
@@ -656,16 +705,18 @@ class QuantBotV9:
                 "oi_change_4h": deriv.oi_change_4h,
                 "oi_divergence": deriv.oi_divergence,
                 "funding_rate": deriv.funding_rate,
-                "smart_money_bias": deriv.smart_money_bias
+                "smart_money_bias": deriv.smart_money_bias,
             },
             "smc": {
                 "bos": smc.bos if smc else "none",
                 "choch": smc.choch if smc else "none",
-                "liquidity_sweep": smc.liquidity_sweep if smc else "none",
+                "liquidity_sweep": (
+                    smc.liquidity_sweep if smc else "none"
+                ),
             },
             "fibo": {
                 "zone": fibo.zone_name if fibo else "",
-                "in_zone": fibo.in_zone if fibo else False,
+                "in_zone": fibo_in_zone,
                 "entry_zone": (
                     [fibo.entry_zone_low, fibo.entry_zone_high]
                     if fibo else []
@@ -691,6 +742,9 @@ class QuantBotV9:
 
         llm_response = await self.agent.analyse(symbol, market_context)
 
+        # ============================================================ #
+        # 8. Final confidence + LLM agreement check
+        # ============================================================ #
         final = self.scorer.compute(
             symbol=symbol,
             klines_df=df_1h,
@@ -703,29 +757,49 @@ class QuantBotV9:
             funding_result=composite.funding,
         )
 
-        # 8. SMC-vs-quant-vs-LLM disagreement check (requirement 3)
         llm_dir = llm_response.get("direction", "neutral")
         if not self._llm_agrees_with_quant_llm(
             llm_dir, bias, agreement.direction,
         ):
             logger.info(
-                f"{symbol}: LLM says {llm_dir}, quant/SMC says "
-                f"{agreement.direction} — refusing trade"
+                f"{symbol}: LLM says {llm_dir}, "
+                f"agreement says {agreement.direction} — refusing"
+            )
+            await self._log_rejected(
+                symbol=symbol,
+                bias=bias,
+                indicators=indicators,
+                deriv=deriv,
+                composite=composite,
+                agreement=agreement,
+                prelim=final,
+                price=current_price,
+                extra_gate=f"llm_mismatch:{llm_dir}!={agreement.direction}",
             )
             return
 
         if not final.is_high_confidence:
             logger.debug(
                 f"{symbol}: not high confidence "
-                f"(raw={final.raw_total:.1f}, cal={final.calibrated_confidence:.2f})"
+                f"(raw={final.raw_total:.1f}, "
+                f"cal={final.calibrated_confidence:.2f}, "
+                f"gates={final.gate_reasons})"
             )
             await self._log_rejected(
-                symbol, bias, indicators, deriv, composite, agreement,
+                symbol=symbol,
+                bias=bias,
+                indicators=indicators,
+                deriv=deriv,
+                composite=composite,
+                agreement=agreement,
                 prelim=final,
+                price=current_price,
             )
             return
 
-        # 9. Classify setups
+        # ============================================================ #
+        # 9. Setup classification
+        # ============================================================ #
         setups = self.setup_classifier.classify_all(
             df_15m=df_15m,
             df_1h=df_1h,
@@ -734,26 +808,46 @@ class QuantBotV9:
             deriv=deriv,
             bias=bias,
         )
+
         if setups.count == 0:
             logger.debug(f"{symbol}: no valid setups")
+            await self._log_rejected(
+                symbol=symbol,
+                bias=bias,
+                indicators=indicators,
+                deriv=deriv,
+                composite=composite,
+                agreement=agreement,
+                prelim=final,
+                price=current_price,
+                extra_gate="no_setups",
+            )
             return
 
-        # 10. Build trade signals per setup and execute the best one
         best = setups.highest_confidence()
         if best is None:
             return
 
-        # Use fib zone as entry price if available, else current price
+        # ============================================================ #
+        # 10. Entry price — use Fibonacci zone when applicable
+        # ============================================================ #
+        entry = current_price
         if fibo is not None and fibo.valid:
-            if fibo.entry_zone_low <= fibo.current_price <= fibo.entry_zone_high:
-                entry = fibo.current_price  # inside zone, use current
+            if fibo.entry_zone_low <= current_price <= fibo.entry_zone_high:
+                # Inside zone — use current
+                entry = current_price
             else:
+                # Outside zone — use near edge as limit
                 entry = (
-                    fibo.entry_zone_low if bias == "long"
+                    fibo.entry_zone_low
+                    if bias == "long"
                     else fibo.entry_zone_high
                 )
-        else:
-            entry = float(df_1h["close"].iloc[-1])
+            logger.debug(
+                f"{symbol}: fib entry={entry:.6f} "
+                f"(zone {fibo.entry_zone_low:.6f}-{fibo.entry_zone_high:.6f}, "
+                f"current={current_price:.6f})"
+            )
 
         sl, tp1, tp2, tp3 = self._compute_tp_levels(
             entry=entry,
@@ -764,7 +858,7 @@ class QuantBotV9:
         signal = TradeSignal(
             symbol=symbol,
             direction=bias,
-            entry_price=entry,
+            entry_price=round(entry, 6),
             stop_loss=round(sl, 6),
             take_profit_1=round(tp1, 6),
             take_profit_2=round(tp2, 6),
@@ -778,10 +872,9 @@ class QuantBotV9:
                 f"Setup={best.setup_type} "
                 f"Raw={final.raw_total:.0f} "
                 f"Agree={agreement.agreement_count} "
-                f"Fibo={'in' if fibo and fibo.in_zone else 'out'}"
+                f"Fibo={'in' if fibo_in_zone else 'out'}"
             ),
             metadata={
-                "signal_id": 0,
                 "setup_type": best.setup_type,
                 "setups": setups.labels,
                 "agreement": agreement.details,
@@ -790,13 +883,16 @@ class QuantBotV9:
                 "quant_dir": composite.direction,
                 "heatmap_dir": heatmap_dir,
                 "fibo_zone": fibo.zone_name if fibo else "",
-                "fibo_in_zone": fibo.in_zone if fibo else False,
+                "fibo_in_zone": fibo_in_zone,
                 "funding_block_long": composite.funding.should_block_long,
                 "funding_block_short": composite.funding.should_block_short,
-                "funding_rate_pct": composite.funding.rate_pct
+                "funding_rate_pct": composite.funding.rate_pct,
             },
         )
 
+        # ============================================================ #
+        # 11. Late skip check — mid-analysis race
+        # ============================================================ #
         skip_reason = self._should_skip_symbol(symbol)
         if skip_reason:
             logger.info(
@@ -804,19 +900,101 @@ class QuantBotV9:
             )
             return
 
-        result = await self.executor.execute_signal(signal)
-        if result["status"] != "filled":
-            return
-
-        # Record cooldown
-        self._record_alert(
-            symbol=symbol,
-            direction=bias,
-            confidence=final.calibrated_confidence,
-            signal_id=0,
+        # ============================================================ #
+        # 12. Build plan for queue
+        # ============================================================ #
+        delay_seconds = int(
+            self.config.get("auto_trade", {}).get(
+                "delay_seconds", 30,
+            )
         )
 
-        # 11. Multi-setup Discord dispatch (requirement 1 & 2)
+        plan = {
+            "direction": bias,
+            "entry_price": float(signal.entry_price),
+            "stop_loss": float(signal.stop_loss),
+            "take_profit_1": float(signal.take_profit_1),
+            "take_profit_2": (
+                float(signal.take_profit_2)
+                if signal.take_profit_2 else None
+            ),
+            "take_profit_3": (
+                float(signal.take_profit_3)
+                if signal.take_profit_3 else None
+            ),
+            "tp_weights": list(signal.tp_weights),
+            "leverage": int(signal.leverage),
+            "delay_seconds": delay_seconds,
+            "setup_type": best.setup_type,
+            "setups": setups.labels,
+            "agreement": agreement.details,
+            "funding_block_long": (
+                composite.funding.should_block_long
+            ),
+            "funding_block_short": (
+                composite.funding.should_block_short
+            ),
+            "metadata": signal.metadata,
+        }
+
+        # ============================================================ #
+        # 13. Log as 'pending' — queue executes later
+        # ============================================================ #
+        signal_dict = {
+            "symbol": symbol,
+            "direction": bias,
+            "timestamp": datetime.utcnow().isoformat(),
+            "entry_price": float(signal.entry_price),
+            "raw_score": final.raw_total,
+            "calibrated_confidence": final.calibrated_confidence,
+            "is_high_confidence": final.is_high_confidence,
+            "gate_reasons": final.gate_reasons,
+            "llm_response": llm_response,
+            "indicators": indicators,
+            "composite_score": composite.total_score,
+            "composite_direction": composite.direction,
+            "composite_conviction": composite.conviction,
+            "zeta": composite.mean_reversion.zeta,
+            "hurst": composite.mean_reversion.hurst,
+            "half_life_hours": (
+                composite.mean_reversion.half_life_hours
+            ),
+            "basis_pct": composite.basis.basis_pct,
+            "funding_annualized_pct": (
+                composite.funding.annualized_pct
+            ),
+            "volume_zscore": composite.volume.z_score,
+            "volume_anomaly_level": composite.volume.anomaly_level,
+            "funding_rate_pct": composite.funding.rate_pct,
+            "funding_regime": composite.funding.regime,
+            "funding_contrarian_bias": (
+                composite.funding.contrarian_bias
+            ),
+            "_breakdown": {
+                "technical_score": final.technical_score,
+                "composite_score": final.composite_score,
+                "derivative_score": final.derivative_score,
+                "sentiment_score": final.sentiment_score,
+                "pattern_score": final.pattern_score,
+                "llm_score": final.llm_score,
+            },
+        }
+
+        signal_id = await self.journal.log_signal(
+            signal_dict,
+            plan=plan,
+            execution_status="pending",
+        )
+
+        if signal_id <= 0:
+            logger.error(
+                f"{symbol}: signal logging failed — skipping alert"
+            )
+            return
+
+        # ============================================================ #
+        # 14. Dispatch Discord alerts
+        # ============================================================ #
         await self._dispatch_multi_setup_alerts(
             symbol=symbol,
             setups=setups,
@@ -830,7 +1008,24 @@ class QuantBotV9:
             smc=smc,
             fibo=fibo,
             heatmap=heatmap,
+            signal_id=signal_id,
+            delay_seconds=delay_seconds,
         )
+
+        # ============================================================ #
+        # 15. Log queue status — queue handles execution
+        # ============================================================ #
+        auto_trade_state = (
+            "on" if self.signal_queue.cfg.enabled else "off"
+        )
+        logger.info(
+            f"{symbol}: signal {signal_id} queued — "
+            f"execution in {delay_seconds}s "
+            f"(auto_trade={auto_trade_state}, "
+            f"setups={setups.labels}, "
+            f"agreement={agreement.agreement_count})"
+        )
+
     def _llm_agrees_with_quant_llm(
         self, llm_dir: str, bias: str, agreement_dir: str,
     ) -> bool:
@@ -887,18 +1082,14 @@ class QuantBotV9:
         self,
         symbol, setups, df_1h, composite, deriv, indicators,
         breakdown, llm_response, agreement, smc, fibo, heatmap,
+        signal_id: int = 0,
+        delay_seconds: int = 0,
     ):
-        """
-        Requirement 1 & 2:
-          3 setups → 3 separate messages
-          2 setups → 1 combined message
-          1 setup  → 1 single message
-        """
         valid = setups.valid_setups
         if not valid:
+            logger.debug(f"{symbol}: no valid setups to dispatch")
             return
 
-        # Chart generated once, reused by all messages
         chart_path = None
         try:
             chart_path = await self.chart_generator.render_signal_chart(
@@ -923,10 +1114,15 @@ class QuantBotV9:
 
         try:
             if len(valid) == 3:
-                # Three separate messages
+                logger.info(
+                    f"{symbol}: dispatching 3 setup alerts "
+                    f"({[s.setup_type for s in valid]})"
+                )
                 for s in valid:
                     await self.notifier.send_signal_alert(
-                        signal=self._setup_to_signal(s, symbol, breakdown),
+                        signal=self._setup_to_signal(
+                            s, symbol, breakdown,
+                        ),
                         breakdown=breakdown,
                         llm_response=llm_response,
                         chart_path=chart_path,
@@ -934,9 +1130,15 @@ class QuantBotV9:
                         deriv=deriv,
                         indicators=indicators,
                         setup_label=s.label,
+                        signal_id=signal_id,
+                        delay_seconds=delay_seconds,
                     )
             else:
-                # One combined message
+                labels = [s.setup_type for s in valid]
+                logger.info(
+                    f"{symbol}: dispatching combined "
+                    f"{len(valid)}-setup alert ({labels})"
+                )
                 await self.notifier.send_multi_setup_alert(
                     symbol=symbol,
                     setups=valid,
@@ -950,9 +1152,14 @@ class QuantBotV9:
                     smc=smc,
                     fibo=fibo,
                     heatmap=heatmap,
+                    signal_id=signal_id,
+                    delay_seconds=delay_seconds,
                 )
         except Exception as e:
-            logger.error(f"Discord dispatch failed for {symbol}: {e}")
+            logger.error(
+                f"Discord dispatch failed for {symbol}: {e}",
+                exc_info=True,
+            )
         finally:
             if chart_path:
                 try:
@@ -960,9 +1167,11 @@ class QuantBotV9:
                 except Exception:
                     pass
 
-    def _setup_to_signal(self, setup, symbol, breakdown):
-        """Build a TradeSignal-like object for a single setup."""
-        direction = setup.direction if setup.direction != "neutral" else "long"
+        def _setup_to_signal(self, setup, symbol, breakdown):
+        """Build a TradeSignal-compatible object for one setup."""
+        direction = (
+            setup.direction if setup.direction != "neutral" else "long"
+        )
         entry = (setup.entry_zone_low + setup.entry_zone_high) / 2
         sl, tp1, tp2, tp3 = self._compute_tp_levels(
             entry=entry, atr=setup.atr, direction=direction,
@@ -978,6 +1187,35 @@ class QuantBotV9:
             confidence=setup.confidence,
             metadata={"setup_type": setup.setup_type},
         )
+    
+    async def _on_trade_filled(self, signal, result, signal_id):
+        """
+        Called by SignalQueue when a queued signal executed successfully.
+        Records cooldown and sends 'TRADE EXECUTED' alert.
+        """
+        self._record_alert(
+            symbol=signal.symbol,
+            direction=signal.direction,
+            confidence=signal.confidence,
+            signal_id=signal_id,
+        )
+
+        if not self.signal_queue.cfg.notify_on_execution:
+            return
+
+        try:
+            await self.notifier.send_trade_executed(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                entry=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                tps=signal.tp_list,
+                qty=result.get("qty", 0.0),
+                signal_id=signal_id,
+            )
+        except Exception as e:
+            logger.error(f"Trade executed alert failed: {e}")
+
     # ================================================================== #
     #  Indicators & patterns
     # ================================================================== #

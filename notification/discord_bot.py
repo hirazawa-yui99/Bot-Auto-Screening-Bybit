@@ -2,35 +2,9 @@
 notification/discord_bot.py
 Per-server Discord routing with combined and split modes.
 
-Config schema (in config.json under "api.discord_servers"):
-
-  [
-    {
-      "name": "Server A",
-      "mode": "combined",
-      "webhook": "https://discord.com/api/webhooks/AAA/aaa"
-    },
-    {
-      "name": "Server B",
-      "mode": "split",
-      "live":      "https://discord.com/api/webhooks/BBB1/bbb1",
-      "quant":     "https://discord.com/api/webhooks/BBB2/bbb2",
-      "dashboard": "https://discord.com/api/webhooks/BBB3/bbb3",
-      "alerts":    "https://discord.com/api/webhooks/BBB3/bbb3"
-    }
-  ]
-
-Modes:
-  combined — all messages to one webhook, signal alerts merged with
-             quant breakdown into a single multi-embed message, one chart.
-  split    — live signals → "live", quant analysis → "quant",
-             dashboard reports → "dashboard", alerts → "alerts".
-             Each field can hold comma-separated URLs for broadcast.
-
-Backward compatibility:
-  If "discord_servers" is absent, the old flat fields
-  (discord_live_webhook, discord_quant_webhook, etc.) are treated
-  as a single virtual "split" server.
+Config (config.json api.discord_servers):
+  Combined mode: single webhook receives all message types
+  Split mode:    live / quant / dashboard / alerts routed separately
 """
 import asyncio
 import json
@@ -56,7 +30,9 @@ class DiscordNotifier:
                 "mode": "split",
                 "live": config.get("discord_live_webhook") or default,
                 "quant": config.get("discord_quant_webhook") or default,
-                "dashboard": config.get("discord_dashboard_webhook") or default,
+                "dashboard": (
+                    config.get("discord_dashboard_webhook") or default
+                ),
                 "alerts": config.get("discord_alerts_webhook") or default,
             }]
         modes = [s.get("mode", "split") for s in self._servers]
@@ -64,9 +40,9 @@ class DiscordNotifier:
             f"DiscordNotifier: {len(self._servers)} server(s) — modes={modes}"
         )
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     #  Low-level HTTP
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     @staticmethod
     def _split_urls(s: str) -> List[str]:
         if not s:
@@ -112,9 +88,9 @@ class DiscordNotifier:
         body = await resp.text()
         raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     #  Dispatchers
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     async def _dispatch_embeds(
         self,
         channel: str,
@@ -122,12 +98,6 @@ class DiscordNotifier:
         quant_embed: Optional[Dict] = None,
         file_path: Optional[str] = None,
     ):
-        """
-        Route embeds to all servers based on their mode.
-
-        Combined: one POST per server, 2 embeds, 1 chart at the end.
-        Split: alert → `channel`, quant → "quant". Two POSTs per server.
-        """
         tasks = []
 
         for server in self._servers:
@@ -157,8 +127,7 @@ class DiscordNotifier:
                 tasks.append(
                     (name, self._post_single(wh, payload, file_path))
                 )
-
-            else:  # split
+            else:
                 if alert_embed:
                     for url in self._split_urls(server.get(channel, "")):
                         e = dict(alert_embed)
@@ -204,7 +173,6 @@ class DiscordNotifier:
         embed: Dict,
         file_path: Optional[str] = None,
     ):
-        """Single-embed dispatch (position closes, emergencies, tuning)."""
         tasks = []
         for server in self._servers:
             mode = server.get("mode", "split")
@@ -222,7 +190,9 @@ class DiscordNotifier:
                         + os.path.basename(file_path)
                     }
                 tasks.append(
-                    (name, self._post_single(wh, {"embeds": [e]}, file_path))
+                    (name, self._post_single(
+                        wh, {"embeds": [e]}, file_path,
+                    ))
                 )
             else:
                 for url in self._split_urls(server.get(channel, "")):
@@ -248,11 +218,17 @@ class DiscordNotifier:
             if isinstance(r, Exception):
                 logger.error(f"Discord send failed (server={name}): {r}")
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     #  Embed builders
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     def _build_alert_embed(
-        self, signal, breakdown, llm_response: Dict,
+        self,
+        signal,
+        breakdown,
+        llm_response: Dict,
+        setup_label: Optional[str] = None,
+        signal_id: int = 0,
+        delay_seconds: int = 0,
     ) -> Dict:
         entry = signal.entry_price
         color = 0x3BA55D if signal.direction == "long" else 0xED4245
@@ -280,38 +256,63 @@ class DiscordNotifier:
         if signal.direction == "short":
             sl_pct = -sl_pct
 
+        title_prefix = f"[{setup_label.upper()}] " if setup_label else ""
+
+        fields = [
+            {"name": "Entry", "value": f"`{entry:.6f}`", "inline": True},
+            {"name": "Stop Loss",
+             "value": f"`{signal.stop_loss:.6f}` ({sl_pct:+.2f}%)",
+             "inline": True},
+            {"name": "R:R (weighted)",
+             "value": f"{signal.risk_reward:.2f}", "inline": True},
+            {"name": "Confidence",
+             "value": f"{signal.confidence:.1%}", "inline": True},
+            {"name": "Raw Score",
+             "value": f"{breakdown.raw_total:.1f}/100", "inline": True},
+            {"name": "Composite",
+             "value": f"{breakdown.composite_score:.1f}/20",
+             "inline": True},
+            {"name": "🎯 Take Profits",
+             "value": "\n".join(tp_lines) or "—",
+             "inline": False},
+        ]
+
+        if signal_id > 0:
+            if delay_seconds > 0:
+                fields.append({
+                    "name": "⏱ Queue",
+                    "value": (
+                        f"Signal `#{signal_id}` · auto-trade ON\n"
+                        f"Executes in **{delay_seconds}s**"
+                    ),
+                    "inline": False,
+                })
+            else:
+                fields.append({
+                    "name": "⏱ Queue",
+                    "value": (
+                        f"Signal `#{signal_id}` · observation mode"
+                    ),
+                    "inline": False,
+                })
+
         embed = {
             "title": (
+                f"{title_prefix}"
                 f"{'🟢' if signal.direction == 'long' else '🔴'} "
                 f"{signal.direction.upper()} SIGNAL · {signal.symbol}"
             ),
             "color": color,
-            "fields": [
-                {"name": "Entry", "value": f"`{entry:.6f}`", "inline": True},
-                {"name": "Stop Loss",
-                 "value": f"`{signal.stop_loss:.6f}` ({sl_pct:+.2f}%)",
-                 "inline": True},
-                {"name": "R:R (weighted)",
-                 "value": f"{signal.risk_reward:.2f}", "inline": True},
-                {"name": "Confidence",
-                 "value": f"{signal.confidence:.1%}", "inline": True},
-                {"name": "Raw Score",
-                 "value": f"{breakdown.raw_total:.1f}/100", "inline": True},
-                {"name": "Composite",
-                 "value": f"{breakdown.composite_score:.1f}/20",
-                 "inline": True},
-                {"name": "🎯 Take Profits",
-                 "value": "\n".join(tp_lines) or "—",
-                 "inline": False},
-            ],
+            "fields": fields,
             "footer": {
                 "text": (
-                    "Bybit Quant v9.1 · "
+                    "Bybit Quant v9.2 · "
                     f"{datetime.utcnow().strftime('%H:%M:%S UTC')}"
                 )
             },
             "timestamp": datetime.utcnow().isoformat(),
         }
+
         if llm_response and llm_response.get("key_reasons"):
             embed["fields"].append({
                 "name": "LLM Reasons",
@@ -432,44 +433,74 @@ class DiscordNotifier:
             ],
             "footer": {
                 "text": (
-                    "Bybit Quant v9.1 · "
+                    "Bybit Quant v9.2 · "
                     f"{datetime.utcnow().strftime('%H:%M:%S UTC')}"
                 )
             },
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     #  Public API
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     async def send_signal_alert(
-        self, signal, breakdown, llm_response: Dict,
+        self,
+        signal,
+        breakdown,
+        llm_response: Dict,
         chart_path: Optional[str] = None,
-        composite=None, deriv=None, indicators: Optional[Dict] = None,
+        composite=None,
+        deriv=None,
+        indicators: Optional[Dict] = None,
         setup_label: Optional[str] = None,
-        signal_id: int = 0,           # ← must be present
-        delay_seconds: int = 0,       # ← must be present
+        signal_id: int = 0,
+        delay_seconds: int = 0,
     ):
         """Send signal alert (and quant breakdown if data provided)."""
-        title_prefix = f"[{setup_label.upper()}] " if setup_label else ""
-        embed = {
-            "title": (
-                f"{title_prefix}"
-                f"{'🟢' if signal.direction == 'long' else '🔴'} "
-                f"{signal.direction.upper()} SIGNAL · {signal.symbol}"
-            ),
-        }
         alert_embed = self._build_alert_embed(
             signal, breakdown, llm_response,
+            setup_label=setup_label,
+            signal_id=signal_id,
+            delay_seconds=delay_seconds,
         )
         quant_embed = None
-        if composite is not None and deriv is not None and indicators is not None:
+        if (
+            composite is not None
+            and deriv is not None
+            and indicators is not None
+        ):
             quant_embed = self._build_quant_embed(
                 signal.symbol, composite, breakdown, deriv, indicators,
             )
         await self._dispatch_embeds(
             channel="live",
             alert_embed=alert_embed,
+            quant_embed=quant_embed,
+            file_path=chart_path,
+        )
+
+    async def send_quant_analysis(
+        self,
+        symbol: str,
+        composite,
+        breakdown,
+        deriv,
+        indicators: Dict,
+        chart_path: Optional[str] = None,
+    ):
+        """Legacy compatibility — send quant analysis standalone."""
+        quant_embed = self._build_quant_embed(
+            symbol, composite, breakdown, deriv, indicators,
+        )
+        if not quant_embed:
+            return
+        if chart_path:
+            quant_embed["image"] = {
+                "url": "attachment://" + os.path.basename(chart_path)
+            }
+        await self._dispatch_embeds(
+            channel="quant",
+            alert_embed=None,
             quant_embed=quant_embed,
             file_path=chart_path,
         )
@@ -491,17 +522,13 @@ class DiscordNotifier:
         signal_id: int = 0,
         delay_seconds: int = 0,
     ):
-        """
-        Send a combined message covering 1–2 setups, or one of three
-        separate messages when the caller iterates 3 setups.
-        """
+        """Send one combined message covering 1–2 setups."""
         if not setups:
             return
 
         labels = [s.setup_type.upper() for s in setups]
         title_label = " + ".join(labels)
 
-        # Direction color
         first_dir = getattr(setups[0], "direction", "neutral")
         if first_dir == "long":
             color = 0x3BA55D
@@ -512,7 +539,6 @@ class DiscordNotifier:
 
         fields = []
 
-        # One field per setup
         for s in setups:
             entry_mid = (
                 getattr(s, "entry_zone_low", 0.0)
@@ -531,7 +557,6 @@ class DiscordNotifier:
                 "inline": False,
             })
 
-        # Agreement summary
         if agreement is not None:
             details_str = ", ".join(
                 f"{k}={v}" for k, v in agreement.details.items()
@@ -547,7 +572,6 @@ class DiscordNotifier:
                 "inline": False,
             })
 
-        # Fib zone
         if fibo is not None and getattr(fibo, "valid", False):
             fields.append({
                 "name": "📊 Fibonacci",
@@ -560,19 +584,20 @@ class DiscordNotifier:
                 "inline": True,
             })
 
-        # Heatmap
         if heatmap is not None and getattr(heatmap, "valid", False):
+            strong_flag = getattr(
+                heatmap, "strong", getattr(heatmap, "strong", False)
+            )
             fields.append({
                 "name": "🔥 Heatmap",
                 "value": (
                     f"Imbalance: **{heatmap.imbalance:+.2f}**\n"
                     f"Direction: {heatmap.direction}\n"
-                    f"Strength: {'strong' if heatmap.strength or heatmap.strong else 'mild'}"
+                    f"Strength: {'strong' if strong_flag else 'mild'}"
                 ),
                 "inline": True,
             })
 
-        # SMC
         if smc is not None:
             fields.append({
                 "name": "🧱 SMC",
@@ -584,22 +609,25 @@ class DiscordNotifier:
                 "inline": True,
             })
 
-        # Queue status
         if signal_id > 0:
-            mode = "auto-trade ON" if delay_seconds > 0 else "observation"
-            fields.append({
-                "name": "⏱ Queue",
-                "value": (
-                    f"Signal `#{signal_id}` · {mode}\n"
-                    + (
+            if delay_seconds > 0:
+                fields.append({
+                    "name": "⏱ Queue",
+                    "value": (
+                        f"Signal `#{signal_id}` · auto-trade ON\n"
                         f"Executes in **{delay_seconds}s**"
-                        if delay_seconds > 0 else "No auto-execution"
-                    )
-                ),
-                "inline": False,
-            })
+                    ),
+                    "inline": False,
+                })
+            else:
+                fields.append({
+                    "name": "⏱ Queue",
+                    "value": (
+                        f"Signal `#{signal_id}` · observation mode"
+                    ),
+                    "inline": False,
+                })
 
-        # Confidence summary
         if breakdown is not None:
             fields.append({
                 "name": "📊 Confidence",
@@ -638,6 +666,51 @@ class DiscordNotifier:
             file_path=chart_path,
         )
 
+    async def send_trade_executed(
+        self,
+        symbol: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        tps: list,
+        qty: float,
+        signal_id: int,
+    ):
+        """Sent after the queue successfully fills a queued trade."""
+        color = 0x3BA55D if direction == "long" else 0xED4245
+        tp_lines = "\n".join(
+            f"TP{i+1}: `${tp:.6f}`"
+            for i, tp in enumerate(tps)
+        )
+        embed = {
+            "title": (
+                f"{'🟢' if direction == 'long' else '🔴'} "
+                f"TRADE EXECUTED · {symbol}"
+            ),
+            "color": color,
+            "fields": [
+                {"name": "Direction",
+                 "value": direction.upper(), "inline": True},
+                {"name": "Qty", "value": f"`{qty}`", "inline": True},
+                {"name": "Signal ID",
+                 "value": f"`#{signal_id}`", "inline": True},
+                {"name": "Entry",
+                 "value": f"`{entry:.6f}`", "inline": True},
+                {"name": "Stop Loss",
+                 "value": f"`{stop_loss:.6f}`", "inline": True},
+                {"name": "🎯 TPs",
+                 "value": tp_lines or "—", "inline": False},
+            ],
+            "footer": {
+                "text": (
+                    "Bybit Quant v9.2 · "
+                    f"{datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                )
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        await self._dispatch_simple("live", embed, None)
+
     async def send_position_closed(
         self,
         symbol: str,
@@ -665,14 +738,21 @@ class DiscordNotifier:
             "color": color,
             "fields": [
                 {"name": "Side", "value": side.upper(), "inline": True},
-                {"name": "Entry", "value": f"`{entry:.6f}`", "inline": True},
-                {"name": "Exit", "value": f"`{exit_price:.6f}`", "inline": True},
-                {"name": "PnL %", "value": f"**{pnl_pct:+.2f}%**", "inline": True},
-                {"name": "PnL USDT", "value": f"**{pnl_usd:+.4f}**", "inline": True},
-                {"name": "TPs Hit", "value": f"{len(filled_tps)}/{total_tps}", "inline": True},
-                {"name": "Exit Reason", "value": exit_reason, "inline": False},
+                {"name": "Entry",
+                 "value": f"`{entry:.6f}`", "inline": True},
+                {"name": "Exit",
+                 "value": f"`{exit_price:.6f}`", "inline": True},
+                {"name": "PnL %",
+                 "value": f"**{pnl_pct:+.2f}%**", "inline": True},
+                {"name": "PnL USDT",
+                 "value": f"**{pnl_usd:+.4f}**", "inline": True},
+                {"name": "TPs Hit",
+                 "value": f"{len(filled_tps)}/{total_tps}",
+                 "inline": True},
+                {"name": "Exit Reason",
+                 "value": exit_reason, "inline": False},
             ],
-            "footer": {"text": "Bybit Quant v9.1"},
+            "footer": {"text": "Bybit Quant v9.2"},
             "timestamp": datetime.utcnow().isoformat(),
         }
         await self._dispatch_simple("alerts", embed, chart_path)
@@ -688,8 +768,12 @@ class DiscordNotifier:
             "title": f"🚨 EMERGENCY · {symbol}",
             "color": 0xFF0000,
             "description": reason,
-            "fields": [{"name": "Detail", "value": detail or "—", "inline": False}],
-            "footer": {"text": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")},
+            "fields": [
+                {"name": "Detail", "value": detail or "—", "inline": False}
+            ],
+            "footer": {
+                "text": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            },
         }
         await self._dispatch_simple("alerts", embed, chart_path)
 
