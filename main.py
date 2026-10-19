@@ -690,10 +690,16 @@ class QuantBotV9:
         indicators = self._compute_indicators(df_1h)
         deriv = await self.derivatives.get_full_snapshot(symbol)
 
-        # ============================================================ #
-        # 4a. Momentum guard — skip if already moving too fast
-        #     5-bar ROC on 1h klines = 5h rate of change.
-        #     Prevents queuing signals that are already extended.
+                # ============================================================ #
+        # 4a. Momentum guard — direction-aware + volatility-scaled
+        #
+        # Skip a signal only when ALL THREE hold:
+        #   1. Price moved in the direction we'd trade (i.e., chase)
+        #   2. Move magnitude >= min absolute % threshold
+        #   3. Move magnitude >= N-sigma relative to ATR
+        #
+        # A price drop before a LONG signal (or a rally before a SHORT
+        # signal) is a BETTER entry, not a worse one — it does NOT skip.
         # ============================================================ #
         momentum_cfg = self.config.get("execution", {})
         roc_threshold = float(
@@ -702,40 +708,109 @@ class QuantBotV9:
         roc_lookback = int(
             momentum_cfg.get("momentum_guard_lookback_bars", 5)
         )
+        sigma_threshold = float(
+            momentum_cfg.get("momentum_guard_sigma", 2.5)
+        )
+        atr_pct_floor = float(
+            momentum_cfg.get("momentum_guard_atr_pct_floor", 0.5)
+        )
+
+        # Preliminary bias from EMAs — composite hasn't run yet
+        ema_9 = indicators.get("ema_9", 0.0)
+        ema_21 = indicators.get("ema_21", 0.0)
+        if ema_9 > ema_21:
+            prelim_bias = "long"
+        elif ema_9 < ema_21:
+            prelim_bias = "short"
+        else:
+            prelim_bias = "neutral"
 
         if roc_threshold > 0 and len(df_1h) > roc_lookback + 2:
             try:
                 closes = df_1h["close"].values
                 current_close = float(closes[-1])
                 past_close = float(closes[-(roc_lookback + 1)])
-                if past_close > 0:
+
+                if past_close > 0 and current_close > 0:
                     roc_pct = (
                         (current_close - past_close) / past_close * 100
                     )
-                    if abs(roc_pct) >= roc_threshold:
+
+                    # ATR% of current price (volatility in %)
+                    atr_val_raw = float(indicators.get("atr", 0.0))
+                    atr_pct = (
+                        atr_val_raw / current_close * 100
+                        if current_close > 0 else 0.0
+                    )
+
+                    # Sigma-normalized move magnitude
+                    # Divide by sqrt(lookback) to account for random walk
+                    if atr_pct > 0:
+                        expected_move = atr_pct * (roc_lookback ** 0.5)
+                        sigma_move = (
+                            abs(roc_pct) / expected_move
+                            if expected_move > 0 else 0.0
+                        )
+                    else:
+                        sigma_move = 999.0   # undefined vol → treat as extreme
+
+                    # Direction check: is this move a chase?
+                    chase_direction = (
+                        (prelim_bias == "long" and roc_pct > 0)
+                        or (prelim_bias == "short" and roc_pct < 0)
+                    )
+
+                    # Both magnitude gates must fire:
+                    #   absolute threshold (floor)
+                    #   sigma threshold (relative to volatility)
+                    abs_gate = abs(roc_pct) >= roc_threshold
+                    sigma_gate = sigma_move >= sigma_threshold
+
+                    # ATR floor: if ATR% is already high (volatile symbol),
+                    # the sigma calculation may be unreliable. Apply a floor
+                    # so the absolute gate isn't ignored for high-vol symbols.
+                    if atr_pct < atr_pct_floor:
+                        sigma_gate = True   # low-vol symbol → sigma is reliable
+                    
+                    should_skip = chase_direction and abs_gate and sigma_gate
+
+                    if should_skip:
                         logger.info(
                             f"{symbol}: momentum guard — "
-                            f"{roc_lookback}h ROC={roc_pct:+.2f}% "
-                            f"≥ {roc_threshold}%, skipping"
+                            f"bias={prelim_bias} "
+                            f"ROC={roc_pct:+.2f}% "
+                            f"ATR%={atr_pct:.2f}% "
+                            f"σ={sigma_move:.1f} "
+                            f"(chase: ROC≥{roc_threshold}%, σ≥{sigma_threshold})"
                         )
                         await self._log_rejected(
                             symbol=symbol,
-                            bias="neutral",
+                            bias=prelim_bias,
                             indicators=indicators,
                             deriv=deriv,
                             composite=None,
                             agreement=None,
                             price=current_close,
                             extra_gate=(
-                                f"momentum_exhausted:{roc_pct:+.2f}%"
+                                f"momentum_chase:"
+                                f"{roc_pct:+.2f}%/{sigma_move:.1f}σ"
                             ),
                         )
                         return
+                    else:
+                        # Log why it passed (debug only)
+                        if chase_direction:
+                            logger.debug(
+                                f"{symbol}: momentum guard passed — "
+                                f"bias={prelim_bias} "
+                                f"ROC={roc_pct:+.2f}% "
+                                f"σ={sigma_move:.1f} "
+                                f"(below threshold)"
+                            )
             except Exception as e:
                 logger.debug(
                     f"Momentum guard failed for {symbol}: {e}"
                 )
-
         # ============================================================ #
         # 4b. Volatility filter — ATR% band
         #     Below min_atr_pct = dead symbol (no edge).
