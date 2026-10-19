@@ -5,7 +5,7 @@ Persist and query signal records + outcomes.
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -15,8 +15,54 @@ class SignalJournal:
     def __init__(self, db):
         self.db = db
 
-    async def log_signal(self, signal: Dict) -> int:
+    async def log_signal(
+        self,
+        signal: Dict,
+        plan: Optional[Dict] = None,
+        execution_status: Optional[str] = None,
+    ) -> int:
+        """
+        Insert a signal into the signals table.
+
+        Args:
+            signal: signal dict (symbol, direction, entry_price, etc.)
+            plan: optional execution plan (SL, TPs, tp_weights, leverage,
+                  delay_seconds, etc.). When provided, the row is marked
+                  'pending' and picked up by the SignalQueue worker.
+            execution_status: override status. Defaults to 'pending' if
+                              plan provided, else 'skipped'.
+        """
+        try:
+            return await self._log_signal_inner(
+                signal,
+                plan=plan,
+                execution_status=execution_status,
+            )
+        except Exception as e:
+            logger.error(
+                f"log_signal failed for "
+                f"{signal.get('symbol', '?')}: {e}"
+            )
+            return -1
+
+    async def _log_signal_inner(
+        self,
+        signal: Dict,
+        plan: Optional[Dict] = None,
+        execution_status: Optional[str] = None,
+    ) -> int:
         breakdown = signal.get("_breakdown") or {}
+
+        # Auto-determine status if caller didn't provide one
+        if execution_status is None:
+            execution_status = "pending" if plan is not None else "skipped"
+
+        # Compute execute_after timestamp
+        execute_after = None
+        if plan is not None:
+            delay = int(plan.get("delay_seconds", 30))
+            execute_after = datetime.utcnow() + timedelta(seconds=delay)
+
         row_id = await self.db.fetchval(
             """
             INSERT INTO signals (
@@ -27,11 +73,15 @@ class SignalJournal:
                 zeta, hurst, half_life_hours, basis_pct,
                 funding_annualized_pct, volume_zscore, volume_anomaly_level,
                 technical_score, composite_score_pct, derivative_score,
-                sentiment_score, pattern_score, llm_score
+                sentiment_score, pattern_score, llm_score,
+                funding_rate_pct, funding_regime, funding_contrarian_bias,
+                execution_status, execute_after, plan
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
                 $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                $21,$22,$23,$24,$25,$26
+                $21,$22,$23,$24,$25,$26,
+                $27,$28,$29,
+                $30,$31,$32
             ) RETURNING id
             """,
             signal["symbol"],
@@ -60,6 +110,12 @@ class SignalJournal:
             breakdown.get("sentiment_score", 0.0),
             breakdown.get("pattern_score", 0.0),
             breakdown.get("llm_score", 0.0),
+            signal.get("funding_rate_pct", 0.0),
+            signal.get("funding_regime", "neutral"),
+            signal.get("funding_contrarian_bias", "neutral"),
+            execution_status,
+            execute_after,
+            json.dumps(plan, default=str) if plan else None,
         )
         return int(row_id)
 
