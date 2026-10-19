@@ -134,7 +134,7 @@ class TradeExecutor:
         self.market_tolerance_pct = config.get(
             "market_tolerance_pct", 0.15,
         )
-        self.max_deviation_pct = config.get("max_deviation_pct", 3.0)
+        self.max_deviation_pct = config.get("max_deviation_pct", 10.0)
         self.cancel_on_rally_pct = config.get(
             "cancel_on_rally_pct", 1.5,
         )
