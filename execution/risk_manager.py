@@ -33,14 +33,14 @@ class RiskManager:
     def _confidence_to_pct(confidence: float) -> float:
         """Map confidence 0..1 to position % of equity: 0.5% to 3.0%."""
         if confidence >= 0.85:
-            return 3.0
+            return 7.0
         if confidence >= 0.75:
-            return 2.0
+            return 6.0
         if confidence >= 0.65:
-            return 1.5
+            return 5.5
         if confidence >= 0.55:
-            return 1.0
-        return 0.5
+            return 5.0
+        return 4
 
     def _maybe_reset_daily(self):
         now = time.time()
