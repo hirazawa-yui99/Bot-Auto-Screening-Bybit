@@ -1034,7 +1034,7 @@ class QuantBotV9:
             return True
         return llm_dir == agreement_dir
 
-        async def _log_rejected(
+    async def _log_rejected(
         self,
         symbol: str,
         bias: str,
