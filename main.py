@@ -1034,49 +1034,159 @@ class QuantBotV9:
             return True
         return llm_dir == agreement_dir
 
-    async def _log_rejected(
-        self, symbol, bias, indicators, deriv, composite, agreement,
+        async def _log_rejected(
+        self,
+        symbol: str,
+        bias: str,
+        indicators: Dict,
+        deriv,
+        composite,
+        agreement,
         prelim=None,
+        price: float = 0.0,
+        extra_gate: str = "",
     ):
-        """Log rejected signal so the auto-tuner has data."""
-        raw = prelim.raw_total if prelim else 0.0
-        cal = prelim.calibrated_confidence if prelim else 0.0
-        gates = prelim.gate_reasons if prelim else []
-        if not agreement.passed:
-            gates = list(gates) + [f"agreement:{agreement.reason}"]
-        await self.journal.log_signal({
-            "symbol": symbol,
-            "direction": bias,
-            "timestamp": datetime.utcnow().isoformat(),
-            "entry_price": float(composite.mean_reversion.mu or 0),
-            "raw_score": raw,
-            "calibrated_confidence": cal,
-            "is_high_confidence": False,
-            "gate_reasons": gates,
-            "llm_response": {},
-            "indicators": indicators,
-            "composite_score": composite.total_score,
-            "composite_direction": composite.direction,
-            "composite_conviction": composite.conviction,
-            "zeta": composite.mean_reversion.zeta,
-            "hurst": composite.mean_reversion.hurst,
-            "half_life_hours": composite.mean_reversion.half_life_hours,
-            "basis_pct": composite.basis.basis_pct,
-            "funding_annualized_pct": composite.funding.annualized_pct,
-            "volume_zscore": composite.volume.z_score,
-            "volume_anomaly_level": composite.volume.anomaly_level,
-            "funding_rate_pct": composite.funding.rate_pct,
-            "funding_regime": composite.funding.regime,
-            "funding_contrarian_bias": composite.funding.contrarian_bias,
-            "_breakdown": {
-                "technical_score": prelim.technical_score if prelim else 0.0,
-                "composite_score": prelim.composite_score if prelim else 0.0,
-                "derivative_score": prelim.derivative_score if prelim else 0.0,
-                "sentiment_score": prelim.sentiment_score if prelim else 0.0,
-                "pattern_score": prelim.pattern_score if prelim else 0.0,
-                "llm_score": prelim.llm_score if prelim else 0.0,
-            },
-        })
+        """
+        Log a rejected signal so the auto-tuner has data.
+
+        All rejection paths in _analyse_and_signal call this. Handles
+        the case where `prelim` is None (rejected before confidence
+        scoring, e.g. agreement gate failure).
+        """
+        # Extract confidence fields (default to 0 if prelim not run)
+        if prelim is not None:
+            raw = float(getattr(prelim, "raw_total", 0.0))
+            cal = float(getattr(prelim, "calibrated_confidence", 0.0))
+            gate_reasons = list(getattr(prelim, "gate_reasons", []) or [])
+            breakdown_dict = {
+                "technical_score": float(
+                    getattr(prelim, "technical_score", 0.0)
+                ),
+                "composite_score": float(
+                    getattr(prelim, "composite_score", 0.0)
+                ),
+                "derivative_score": float(
+                    getattr(prelim, "derivative_score", 0.0)
+                ),
+                "sentiment_score": float(
+                    getattr(prelim, "sentiment_score", 0.0)
+                ),
+                "pattern_score": float(
+                    getattr(prelim, "pattern_score", 0.0)
+                ),
+                "llm_score": float(
+                    getattr(prelim, "llm_score", 0.0)
+                ),
+            }
+        else:
+            raw = 0.0
+            cal = 0.0
+            gate_reasons = []
+            breakdown_dict = {
+                "technical_score": 0.0,
+                "composite_score": 0.0,
+                "derivative_score": 0.0,
+                "sentiment_score": 0.0,
+                "pattern_score": 0.0,
+                "llm_score": 0.0,
+            }
+
+        # Agreement gate reason
+        if agreement is not None and not agreement.passed:
+            gate_reasons.append(f"agreement:{agreement.reason}")
+
+        # Extra gate (LLM mismatch, no setups, etc.)
+        if extra_gate:
+            gate_reasons.append(extra_gate)
+
+        # Ensure at least one reason
+        if not gate_reasons:
+            gate_reasons = ["rejected_unknown"]
+
+        # Entry price: prefer provided, else composite long-run mean
+        entry_price = float(price) if price > 0 else 0.0
+        if entry_price <= 0 and composite is not None:
+            try:
+                entry_price = float(
+                    composite.mean_reversion.mu or 0.0
+                )
+            except Exception:
+                entry_price = 0.0
+
+        try:
+            await self.journal.log_signal(
+                {
+                    "symbol": symbol,
+                    "direction": bias,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "entry_price": entry_price,
+                    "raw_score": raw,
+                    "calibrated_confidence": cal,
+                    "is_high_confidence": False,
+                    "gate_reasons": gate_reasons,
+                    "llm_response": {},
+                    "indicators": indicators or {},
+                    "composite_score": (
+                        float(getattr(composite, "total_score", 0.0))
+                        if composite else 0.0
+                    ),
+                    "composite_direction": (
+                        getattr(composite, "direction", "neutral")
+                        if composite else "neutral"
+                    ),
+                    "composite_conviction": (
+                        getattr(composite, "conviction", "low")
+                        if composite else "low"
+                    ),
+                    "zeta": (
+                        float(composite.mean_reversion.zeta)
+                        if composite else 0.0
+                    ),
+                    "hurst": (
+                        float(composite.mean_reversion.hurst)
+                        if composite else 0.5
+                    ),
+                    "half_life_hours": (
+                        float(composite.mean_reversion.half_life_hours)
+                        if composite else 0.0
+                    ),
+                    "basis_pct": (
+                        float(composite.basis.basis_pct)
+                        if composite else 0.0
+                    ),
+                    "funding_annualized_pct": (
+                        float(composite.funding.annualized_pct)
+                        if composite else 0.0
+                    ),
+                    "volume_zscore": (
+                        float(composite.volume.z_score)
+                        if composite else 0.0
+                    ),
+                    "volume_anomaly_level": (
+                        getattr(composite.volume, "anomaly_level", "normal")
+                        if composite else "normal"
+                    ),
+                    "funding_rate_pct": (
+                        float(composite.funding.rate_pct)
+                        if composite else 0.0
+                    ),
+                    "funding_regime": (
+                        getattr(composite.funding, "regime", "neutral")
+                        if composite else "neutral"
+                    ),
+                    "funding_contrarian_bias": (
+                        getattr(
+                            composite.funding,
+                            "contrarian_bias",
+                            "neutral",
+                        ) if composite else "neutral"
+                    ),
+                    "_breakdown": breakdown_dict,
+                },
+                execution_status="skipped",
+            )
+        except Exception as e:
+            logger.debug(f"_log_rejected failed for {symbol}: {e}")
 
     async def _dispatch_multi_setup_alerts(
         self,
