@@ -33,13 +33,13 @@ class RiskManager:
     def _confidence_to_pct(confidence: float) -> float:
         """Map confidence 0..1 to position % of equity: 0.5% to 3.0%."""
         if confidence >= 0.85:
-            return 15.0
+            return 3.0
         if confidence >= 0.75:
-            return 10.0
+            return 2.0
         if confidence >= 0.65:
-            return 5.0
+            return 1.5
         if confidence >= 0.55:
-            return 5.0
+            return 1.0
         return 0.5
 
     def _maybe_reset_daily(self):
@@ -95,14 +95,20 @@ class RiskManager:
         equity = self.state.current_equity or 100.0
         conf = getattr(signal, "confidence", 0.5)
         size_pct = self._confidence_to_pct(conf) / 100.0
-        size_usd = equity * size_pct
-
-        # Cap by leverage
         leverage = getattr(signal, "leverage", 5)
-        notional_cap = equity * leverage * size_pct
-        size_usd = min(size_usd, notional_cap)
 
-        return True, size_usd, f"approved:{size_pct*100:.1f}%"
+        # Margin at risk = size_pct × equity
+        margin_usd = equity * size_pct
+
+        # Notional exposure = margin × leverage
+        notional_usd = margin_usd * leverage
+
+        # Safety cap: notional should never exceed equity × leverage
+        # (implicit since margin < equity, but explicit for clarity)
+        max_notional = equity * leverage
+        notional_usd = min(notional_usd, max_notional)
+
+        return True, notional_usd, f"approved:{size_pct*100:.2f}%_margin"
 
     def update_equity(self, equity: float):
         self.state.current_equity = equity
