@@ -298,3 +298,130 @@ async def send_discord_report(
                 )
             else:
                 print("Discord report sent")
+
+def print_portfolio_report(
+    result,
+    metrics: dict,
+    start_date: str,
+    end_date: str,
+    num_symbols: int,
+):
+    """Print portfolio-level backtest report."""
+    print()
+    print("=" * 78)
+    print(f"  PORTFOLIO BACKTEST REPORT")
+    print(f"  {start_date} → {end_date}  ({num_symbols} symbols)")
+    print("=" * 78)
+    print()
+
+    if metrics["total_trades"] == 0:
+        print("  No trades executed.")
+        print()
+        print(f"  Skipped due to margin     : {result.skipped_due_to_margin}")
+        print(f"  Skipped due to positions  : {result.skipped_due_to_positions}")
+        print(f"  Skipped due to drawdown   : {result.skipped_due_to_drawdown}")
+        print()
+        return
+
+    # Ruin warning front and center
+    if metrics["ruined"]:
+        print("  ╔══════════════════════════════════════════════════════════╗")
+        print("  ║  ⚠️  PORTFOLIO RUINED                                    ║")
+        print("  ║  Equity reached $0 — all subsequent signals skipped      ║")
+        if metrics.get("ruin_symbol"):
+            print(f"  ║  Killed by: {metrics['ruin_symbol']:<44}║")
+        print("  ╚══════════════════════════════════════════════════════════╝")
+        print()
+
+    print("EQUITY")
+    print("-" * 78)
+    print(f"  Started with      : ${metrics['started_with']:,.2f}")
+    print(f"  Ended with        : ${metrics['ended_with']:,.2f}")
+    print(f"  Total return      : {metrics['total_return_pct']:+.2f}% "
+          f"(${metrics['total_return_usd']:+,.2f})")
+    print(f"  Peak equity       : ${metrics['peak_equity']:,.2f}")
+    print(f"  Trough equity     : ${metrics['trough_equity']:,.2f}")
+    print(f"  Max drawdown      : {metrics['max_drawdown_pct']:+.2f}%")
+    print()
+
+    print("TRADING")
+    print("-" * 78)
+    print(f"  Trades executed   : {metrics['total_trades']}")
+    print(f"  Wins / Losses     : {metrics['wins']} / {metrics['losses']}")
+    print(f"  Win rate          : {metrics['win_rate']:.1%}")
+    print(f"  Avg trade USD     : ${metrics['avg_pnl_usd']:+.4f}")
+    print(f"  Best trade        : ${metrics['best_trade_usd']:+.4f}")
+    print(f"  Worst trade       : ${metrics['worst_trade_usd']:+.4f}")
+    print()
+
+    print("CONSTRAINTS")
+    print("-" * 78)
+    print(f"  Peak open positions    : {metrics['peak_open_positions']}")
+    print(f"  Avg open positions     : {metrics['avg_open_positions']:.1f}")
+    print(f"  Skipped — margin       : {metrics['skipped_due_to_margin']}")
+    print(f"  Skipped — max positions: {metrics['skipped_due_to_positions']}")
+    print(f"  Skipped — drawdown     : {metrics['skipped_due_to_drawdown']}")
+    print()
+
+    by_symbol = metrics.get("by_symbol", {})
+    if by_symbol:
+        # Top 10 winners
+        sorted_by_pnl = sorted(
+            by_symbol.items(),
+            key=lambda x: x[1]["total_pnl_usd"],
+            reverse=True,
+        )
+        print("TOP 10 SYMBOLS BY PnL")
+        print("-" * 78)
+        print(f"  {'Symbol':<16} {'Trades':>7} {'Win%':>7} "
+              f"{'PnL USD':>12} {'PnL %':>9}")
+        print("  " + "-" * 60)
+        for sym, d in sorted_by_pnl[:10]:
+            print(
+                f"  {sym:<16} {d['trades']:>7} "
+                f"{d['win_rate']:>6.1%} "
+                f"{d['total_pnl_usd']:>+11.4f} "
+                f"{d['total_pnl_pct']:>+8.2f}%"
+            )
+        print()
+
+        # Worst 10
+        print("BOTTOM 10 SYMBOLS BY PnL")
+        print("-" * 78)
+        print(f"  {'Symbol':<16} {'Trades':>7} {'Win%':>7} "
+              f"{'PnL USD':>12} {'PnL %':>9}")
+        print("  " + "-" * 60)
+        for sym, d in sorted_by_pnl[-10:]:
+            print(
+                f"  {sym:<16} {d['trades']:>7} "
+                f"{d['win_rate']:>6.1%} "
+                f"{d['total_pnl_usd']:>+11.4f} "
+                f"{d['total_pnl_pct']:>+8.2f}%"
+            )
+        print()
+
+    # Equity curve text chart
+    if result.equity_curve:
+        print("EQUITY CURVE (USD)")
+        print("-" * 78)
+        eq_values = [p["equity"] for p in result.equity_curve]
+        if len(eq_values) > 5:
+            n_points = min(60, len(eq_values))
+            step = max(1, len(eq_values) // n_points)
+            sampled = eq_values[::step]
+            mn, mx = min(sampled), max(sampled)
+            if mx == mn:
+                mx = mn + 1
+            rows = []
+            for row in range(10, 0, -1):
+                threshold = mn + (mx - mn) * row / 10
+                line = "".join(
+                    "█" if v >= threshold else " "
+                    for v in sampled
+                )
+                rows.append(f"  ${threshold:>8.2f} │{line}")
+            print("\n".join(rows))
+            print("             └" + "─" * len(sampled))
+        print()
+
+    print("=" * 78)
