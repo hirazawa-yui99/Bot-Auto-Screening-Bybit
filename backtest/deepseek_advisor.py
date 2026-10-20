@@ -250,10 +250,6 @@ class DeepSeekAdvisor:
         positions: List,
         current_config: Dict,
     ) -> Optional[Dict]:
-        """
-        Send metrics to DeepSeek, return parsed JSON recommendation.
-        Returns None on failure.
-        """
         if not self.api_key:
             logger.warning(
                 "DeepSeek advisor: no api_key configured — skipping"
@@ -265,9 +261,13 @@ class DeepSeekAdvisor:
         user_msg = (
             "Backtest results:\n"
             f"{json.dumps(context, indent=2)}\n\n"
-            "Return ONLY the JSON object described in the system prompt."
+            "Return ONLY the JSON object described in the system prompt. "
+            "No markdown, no explanation, no preamble — just the JSON."
         )
 
+        # Advisor task is analytical, not creative.
+        # Low reasoning + higher max_tokens avoids the
+        # "reasoning ate all my output budget" failure.
         payload = {
             "model": self.model,
             "messages": [
@@ -275,10 +275,114 @@ class DeepSeekAdvisor:
                 {"role": "user", "content": user_msg},
             ],
             "temperature": 0.2,
-            "max_tokens": 2500,
-            "response_format": {"type": "json_object"},
+            "max_tokens": 8000,               # was 2500 — plenty for JSON + margin
         }
 
+        # Only send reasoning_effort if the model is a reasoning model.
+        # DeepSeek accepts "low" | "medium" | "high" for v4-pro / reasoner.
+        if "pro" in self.model.lower() or "reasoner" in self.model.lower():
+            payload["reasoning_effort"] = "low"
+
+        # Some DeepSeek deployments reject response_format; try with it,
+        # fall back to plain text on error.
+        payload_with_format = dict(payload)
+        payload_with_format["response_format"] = {"type": "json_object"}
+
+        data = await self._call_api(payload_with_format, expect_json=True)
+        if data is None:
+            logger.warning(
+                "DeepSeek advisor: json_object mode failed — "
+                "retrying without response_format"
+            )
+            data = await self._call_api(payload, expect_json=False)
+
+        if data is None:
+            return None
+
+        if "error" in data:
+            logger.error(f"DeepSeek error: {data['error']}")
+            return None
+
+        try:
+            choice = data["choices"][0]
+            message = choice["message"]
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            finish_reason = choice.get("finish_reason", "?")
+            usage = data.get("usage", {})
+
+            logger.info(
+                f"DeepSeek response: "
+                f"finish={finish_reason} "
+                f"content_len={len(content)} "
+                f"reasoning_len={len(reasoning)} "
+                f"tokens={usage}"
+            )
+
+            # Case 1: content is empty, reasoning has text
+            # (V4-Pro in thinking mode sometimes puts everything
+            #  in reasoning_content and leaves content blank)
+            if not content.strip() and reasoning.strip():
+                logger.warning(
+                    "DeepSeek returned empty content but non-empty "
+                    "reasoning — attempting to extract JSON from "
+                    "reasoning_content"
+                )
+                content = reasoning
+
+            # Case 2: content still empty → total failure
+            if not content.strip():
+                logger.error(
+                    f"DeepSeek returned no content. "
+                    f"finish_reason={finish_reason}, "
+                    f"usage={usage}. "
+                    f"Full response: {json.dumps(data)[:1000]}"
+                )
+                return None
+
+            # Case 3: truncated mid-output → no JSON possible
+            if finish_reason == "length":
+                logger.error(
+                    f"DeepSeek truncated at max_tokens. "
+                    f"Content preview: {content[:500]}"
+                )
+                return None
+
+            # Strip markdown fences if present
+            content = content.strip()
+            if content.startswith("```"):
+                parts = content.split("```")
+                if len(parts) >= 2:
+                    content = parts[1]
+                    if content.startswith("json"):
+                        content = content[4:]
+                    content = content.split("```")[0]
+                content = content.strip()
+
+            # Find first { and last } — some models add preamble
+            first = content.find("{")
+            last = content.rfind("}")
+            if first > 0 or last < len(content) - 1:
+                if first >= 0 and last > first:
+                    content = content[first:last + 1]
+
+            parsed = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"Failed to parse DeepSeek JSON: {e}. "
+                f"Raw content: {content[:1000]}"
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                f"Unexpected error parsing DeepSeek response: {e}"
+            )
+            return None
+
+        return parsed
+
+    async def _call_api(self, payload: Dict, expect_json: bool = True) -> Optional[Dict]:
+        """Send payload to DeepSeek. Returns parsed JSON response or None."""
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
@@ -294,35 +398,13 @@ class DeepSeekAdvisor:
                     if resp.status != 200:
                         body = await resp.text()
                         logger.error(
-                            f"DeepSeek advisor HTTP {resp.status}: "
-                            f"{body[:300]}"
+                            f"DeepSeek HTTP {resp.status}: {body[:500]}"
                         )
                         return None
-                    data = await resp.json()
+                    return await resp.json()
         except Exception as e:
-            logger.error(f"DeepSeek advisor request failed: {e}")
+            logger.error(f"DeepSeek request failed: {e}")
             return None
-
-        if "error" in data:
-            logger.error(f"DeepSeek error: {data['error']}")
-            return None
-
-        try:
-            content = data["choices"][0]["message"]["content"]
-            # Strip markdown fences if the model added them anyway
-            content = content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.split("```")[0]
-            parsed = json.loads(content.strip())
-        except Exception as e:
-            logger.error(f"Failed to parse DeepSeek JSON: {e}")
-            logger.debug(f"Raw content: {content[:500]}")
-            return None
-
-        return parsed
 
     # ------------------------------------------------------------------ #
     #  Validate + sanitize
