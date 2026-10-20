@@ -265,44 +265,55 @@ class DeepSeekAdvisor:
             "No markdown, no explanation, no preamble — just the JSON."
         )
 
-        # Advisor task is analytical, not creative.
-        # Low reasoning + higher max_tokens avoids the
-        # "reasoning ate all my output budget" failure.
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": ADVISOR_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 8000,               # was 2500 — plenty for JSON + margin
-        }
+        # Attempt 1: user-configured model
+        primary = self._build_payload(
+            self.model, user_msg, with_json_format=True,
+        )
+        logger.info(
+            f"DeepSeek advisor: calling {self.model} "
+            f"(timeout={self.timeout}s, max_tokens=8000)"
+        )
+        data = await self._call_api(primary, expect_json=True)
 
-        # Only send reasoning_effort if the model is a reasoning model.
-        # DeepSeek accepts "low" | "medium" | "high" for v4-pro / reasoner.
-        if "pro" in self.model.lower() or "reasoner" in self.model.lower():
-            payload["reasoning_effort"] = "low"
-
-        # Some DeepSeek deployments reject response_format; try with it,
-        # fall back to plain text on error.
-        payload_with_format = dict(payload)
-        payload_with_format["response_format"] = {"type": "json_object"}
-
-        data = await self._call_api(payload_with_format, expect_json=True)
+        # Attempt 2: retry without response_format
         if data is None:
             logger.warning(
-                "DeepSeek advisor: json_object mode failed — "
-                "retrying without response_format"
+                f"{self.model} failed — retrying without "
+                f"response_format (timeout={self.timeout}s)"
             )
-            data = await self._call_api(payload, expect_json=False)
+            fallback_payload = self._build_payload(
+                self.model, user_msg, with_json_format=False,
+            )
+            data = await self._call_api(
+                fallback_payload, expect_json=False,
+            )
+
+        # Attempt 3: fast model fallback (deepseek-chat)
+        if data is None and self.model != "deepseek-chat":
+            logger.warning(
+                f"{self.model} failed twice — falling back to "
+                f"deepseek-chat (fast, non-reasoning)"
+            )
+            fallback_payload = self._build_payload(
+                "deepseek-chat", user_msg, with_json_format=True,
+            )
+            data = await self._call_api(
+                fallback_payload, expect_json=True,
+            )
 
         if data is None:
+            logger.error(
+                f"DeepSeek advisor: ALL attempts failed "
+                f"(primary={self.model}). "
+                f"Advisor skipped — check network and API key."
+            )
             return None
 
         if "error" in data:
-            logger.error(f"DeepSeek error: {data['error']}")
+            logger.error(f"DeepSeek API error: {data['error']}")
             return None
 
+        # Parse
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -310,45 +321,38 @@ class DeepSeekAdvisor:
             reasoning = message.get("reasoning_content") or ""
             finish_reason = choice.get("finish_reason", "?")
             usage = data.get("usage", {})
+            actual_model = data.get("model", "?")
 
             logger.info(
-                f"DeepSeek response: "
+                f"DeepSeek response: model={actual_model} "
                 f"finish={finish_reason} "
                 f"content_len={len(content)} "
                 f"reasoning_len={len(reasoning)} "
                 f"tokens={usage}"
             )
 
-            # Case 1: content is empty, reasoning has text
-            # (V4-Pro in thinking mode sometimes puts everything
-            #  in reasoning_content and leaves content blank)
             if not content.strip() and reasoning.strip():
                 logger.warning(
                     "DeepSeek returned empty content but non-empty "
-                    "reasoning — attempting to extract JSON from "
-                    "reasoning_content"
+                    "reasoning_content — extracting JSON from reasoning"
                 )
                 content = reasoning
 
-            # Case 2: content still empty → total failure
             if not content.strip():
                 logger.error(
-                    f"DeepSeek returned no content. "
-                    f"finish_reason={finish_reason}, "
-                    f"usage={usage}. "
-                    f"Full response: {json.dumps(data)[:1000]}"
+                    f"DeepSeek returned empty content. "
+                    f"finish={finish_reason}, usage={usage}. "
+                    f"Raw response: {json.dumps(data)[:1000]}"
                 )
                 return None
 
-            # Case 3: truncated mid-output → no JSON possible
             if finish_reason == "length":
                 logger.error(
                     f"DeepSeek truncated at max_tokens. "
-                    f"Content preview: {content[:500]}"
+                    f"Content: {content[:500]}"
                 )
                 return None
 
-            # Strip markdown fences if present
             content = content.strip()
             if content.startswith("```"):
                 parts = content.split("```")
@@ -359,14 +363,13 @@ class DeepSeekAdvisor:
                     content = content.split("```")[0]
                 content = content.strip()
 
-            # Find first { and last } — some models add preamble
             first = content.find("{")
             last = content.rfind("}")
-            if first > 0 or last < len(content) - 1:
-                if first >= 0 and last > first:
-                    content = content[first:last + 1]
+            if first >= 0 and last > first:
+                content = content[first:last + 1]
 
-            parsed = json.loads(content)
+            return json.loads(content)
+
         except json.JSONDecodeError as e:
             logger.error(
                 f"Failed to parse DeepSeek JSON: {e}. "
@@ -379,16 +382,42 @@ class DeepSeekAdvisor:
             )
             return None
 
-        return parsed
+    def _build_payload(
+        self, model: str, user_msg: str, with_json_format: bool,
+    ) -> Dict:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": ADVISOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 8000,
+        }
+        # Only send reasoning_effort for reasoning models
+        if "pro" in model.lower() or "reasoner" in model.lower():
+            payload["reasoning_effort"] = "low"
+        if with_json_format:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
-    async def _call_api(self, payload: Dict, expect_json: bool = True) -> Optional[Dict]:
+    async def _call_api(
+        self, payload: Dict, expect_json: bool = True,
+    ) -> Optional[Dict]:
         """Send payload to DeepSeek. Returns parsed JSON response or None."""
+        model = payload.get("model", "?")
+        url = f"{self.base_url}/chat/completions"
+
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                timeout=aiohttp.ClientTimeout(
+                    total=self.timeout,
+                    connect=15,            # fail fast if unreachable
+                    sock_read=self.timeout,
+                ),
             ) as session:
                 async with session.post(
-                    f"{self.base_url}/chat/completions",
+                    url,
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
@@ -398,12 +427,51 @@ class DeepSeekAdvisor:
                     if resp.status != 200:
                         body = await resp.text()
                         logger.error(
-                            f"DeepSeek HTTP {resp.status}: {body[:500]}"
+                            f"DeepSeek HTTP {resp.status} "
+                            f"(model={model}): {body[:500]}"
                         )
                         return None
-                    return await resp.json()
+
+                    try:
+                        return await resp.json()
+                    except aiohttp.ContentTypeError:
+                        text = await resp.text()
+                        logger.error(
+                            f"DeepSeek returned non-JSON content: "
+                            f"{text[:500]}"
+                        )
+                        return None
+
+        except asyncio.TimeoutError:
+            # Most common failure for reasoning models — this is what
+            # was happening before. Log it explicitly so it's not blank.
+            logger.error(
+                f"DeepSeek TIMEOUT after {self.timeout}s "
+                f"(model={model}). "
+                f"Reasoning models can take 90-180s — increase timeout "
+                f"or switch to a fast model."
+            )
+            return None
+
+        except aiohttp.ClientConnectorError as e:
+            logger.error(
+                f"DeepSeek CONNECTION ERROR (model={model}): "
+                f"cannot reach {self.base_url} — {e}"
+            )
+            return None
+
+        except aiohttp.ClientError as e:
+            logger.error(
+                f"DeepSeek CLIENT ERROR (model={model}): "
+                f"{type(e).__name__}: {e or '(no message)'}"
+            )
+            return None
+
         except Exception as e:
-            logger.error(f"DeepSeek request failed: {e}")
+            logger.error(
+                f"DeepSeek UNEXPECTED ERROR (model={model}): "
+                f"{type(e).__name__}: {e or '(no message)'}"
+            )
             return None
 
     # ------------------------------------------------------------------ #

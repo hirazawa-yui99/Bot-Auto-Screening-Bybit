@@ -154,12 +154,16 @@ async def run_advisor(
         print()
         print("⚠ DeepSeek advisor skipped: no api_key in config.json")
         return 0
-
+        
+    # AFTER:
     advisor = DeepSeekAdvisor(
         api_key=api_key,
         base_url=ds_cfg.get("base_url", "https://api.deepseek.com/v1"),
-        model=ds_cfg.get("model", "deepseek-v4-pro"),
-        timeout=ds_cfg.get("timeout", 60),
+        model=ds_cfg.get(
+            "advisor_model",
+            ds_cfg.get("model", "deepseek-chat"),
+        ),
+        timeout=ds_cfg.get("timeout", 120),
     )
 
     print()
