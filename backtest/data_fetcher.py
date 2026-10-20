@@ -45,98 +45,6 @@ class BybitDataFetcher:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
-    
-        async def list_all_symbols(
-        self,
-        min_turnover_24h: float = 1_000_000,
-        only_perpetual: bool = True,
-        quote_coin: str = "USDT",
-    ) -> list:
-        """
-        Fetch all active linear perpetual symbols, filtered by
-        24h turnover. Mirrors BybitV5Client.get_all_linear_symbols()
-        but without importing the trading client.
-        """
-        session = await self._get_session()
-
-        # 1. All linear instruments (paginated)
-        all_instruments = []
-        cursor = None
-        page = 0
-        while True:
-            params = {"category": self.category, "limit": 500}
-            if cursor:
-                params["cursor"] = cursor
-            url = f"{API_BASE}/v5/market/instruments-info"
-            try:
-                async with session.get(url, params=params) as resp:
-                    data = await resp.json()
-            except Exception as e:
-                logger.error(f"Instruments fetch failed: {e}")
-                break
-            result = data.get("result", {})
-            batch = result.get("list", [])
-            if not batch:
-                break
-            all_instruments.extend(batch)
-            cursor = result.get("nextPageCursor")
-            page += 1
-            if not cursor:
-                break
-            await asyncio.sleep(0.15)
-
-        logger.info(
-            f"Fetched {len(all_instruments)} linear instruments"
-        )
-
-        # 2. Filter
-        filtered = []
-        for inst in all_instruments:
-            if inst.get("quoteCoin") != quote_coin:
-                continue
-            if inst.get("status") != "Trading":
-                continue
-            if only_perpetual and inst.get("contractType") != "LinearPerpetual":
-                continue
-            filtered.append(inst["symbol"])
-
-        if not filtered:
-            return []
-
-        # 3. Turnover filter
-        url = f"{API_BASE}/v5/market/tickers"
-        try:
-            async with session.get(
-                url, params={"category": self.category},
-            ) as resp:
-                data = await resp.json()
-        except Exception as e:
-            logger.error(f"Tickers fetch failed: {e}")
-            return filtered
-
-        tickers = data.get("result", {}).get("list", [])
-        turnover_map = {}
-        for t in tickers:
-            sym = t.get("symbol")
-            if not sym:
-                continue
-            try:
-                turnover = float(t.get("turnover24h") or 0)
-            except (TypeError, ValueError):
-                turnover = 0.0
-            turnover_map[sym] = turnover
-
-        symbols = [
-            s for s in filtered
-            if turnover_map.get(s, 0) >= min_turnover_24h
-        ]
-        symbols.sort(key=lambda s: turnover_map.get(s, 0), reverse=True)
-
-        logger.info(
-            f"After filters: {len(symbols)} symbols with "
-            f">= ${min_turnover_24h:,.0f} 24h turnover"
-        )
-        return symbols
 
     # ------------------------------------------------------------------ #
     #  Kline fetch with pagination
@@ -216,14 +124,13 @@ class BybitDataFetcher:
                 break
 
             all_klines.extend(batch)
-            # Bybit returns newest-first; `end` for next page = oldest ts
             oldest_ts = int(batch[-1][0])
             cursor_end = oldest_ts - 1
             logger.debug(
                 f"Page {page}: {len(batch)} bars, "
                 f"oldest={pd.to_datetime(oldest_ts, unit='ms')}"
             )
-            await asyncio.sleep(0.1)  # polite pacing
+            await asyncio.sleep(0.1)
 
         if not all_klines:
             return pd.DataFrame()
@@ -446,7 +353,111 @@ class BybitDataFetcher:
         )
 
         return {
-            "klines": klines if isinstance(klines, pd.DataFrame) else pd.DataFrame(),
-            "funding": funding if isinstance(funding, pd.DataFrame) else pd.DataFrame(),
-            "oi": oi if isinstance(oi, pd.DataFrame) else pd.DataFrame(),
+            "klines": (
+                klines if isinstance(klines, pd.DataFrame)
+                else pd.DataFrame()
+            ),
+            "funding": (
+                funding if isinstance(funding, pd.DataFrame)
+                else pd.DataFrame()
+            ),
+            "oi": (
+                oi if isinstance(oi, pd.DataFrame)
+                else pd.DataFrame()
+            ),
         }
+
+    # ------------------------------------------------------------------ #
+    #  Symbol discovery (used by run_all_pairs)
+    # ------------------------------------------------------------------ #
+    async def list_all_symbols(
+        self,
+        min_turnover_24h: float = 1_000_000,
+        only_perpetual: bool = True,
+        quote_coin: str = "USDT",
+    ) -> list:
+        """
+        Fetch all active linear perpetual symbols, filtered by
+        24h turnover. Mirrors BybitV5Client.get_all_linear_symbols()
+        but without importing the trading client.
+        """
+        session = await self._get_session()
+
+        # 1. All linear instruments (paginated)
+        all_instruments = []
+        cursor = None
+        page = 0
+        while True:
+            params = {"category": self.category, "limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+            url = f"{API_BASE}/v5/market/instruments-info"
+            try:
+                async with session.get(url, params=params) as resp:
+                    data = await resp.json()
+            except Exception as e:
+                logger.error(f"Instruments fetch failed: {e}")
+                break
+            result = data.get("result", {})
+            batch = result.get("list", [])
+            if not batch:
+                break
+            all_instruments.extend(batch)
+            cursor = result.get("nextPageCursor")
+            page += 1
+            if not cursor:
+                break
+            await asyncio.sleep(0.15)
+
+        logger.info(
+            f"Fetched {len(all_instruments)} linear instruments"
+        )
+
+        # 2. Filter
+        filtered = []
+        for inst in all_instruments:
+            if inst.get("quoteCoin") != quote_coin:
+                continue
+            if inst.get("status") != "Trading":
+                continue
+            if only_perpetual and inst.get("contractType") != "LinearPerpetual":
+                continue
+            filtered.append(inst["symbol"])
+
+        if not filtered:
+            return []
+
+        # 3. Turnover filter
+        url = f"{API_BASE}/v5/market/tickers"
+        try:
+            async with session.get(
+                url, params={"category": self.category},
+            ) as resp:
+                data = await resp.json()
+        except Exception as e:
+            logger.error(f"Tickers fetch failed: {e}")
+            return filtered
+
+        tickers = data.get("result", {}).get("list", [])
+        turnover_map = {}
+        for t in tickers:
+            sym = t.get("symbol")
+            if not sym:
+                continue
+            try:
+                turnover = float(t.get("turnover24h") or 0)
+            except (TypeError, ValueError):
+                turnover = 0.0
+            turnover_map[sym] = turnover
+
+        symbols = [
+            s for s in filtered
+            if turnover_map.get(s, 0) >= min_turnover_24h
+        ]
+        symbols.sort(key=lambda s: turnover_map.get(s, 0), reverse=True)
+
+        logger.info(
+            f"After filters: {len(symbols)} symbols with "
+            f">= ${min_turnover_24h:,.0f} 24h turnover"
+        )
+        return symbols
