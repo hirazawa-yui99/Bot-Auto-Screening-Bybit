@@ -219,10 +219,36 @@ class TradeExecutor:
     # ================================================================== #
     #  Entry routing
     # ================================================================== #
-    async def execute_signal(self, signal: TradeSignal) -> Dict:
-        approved, size_usd, reason = self.risk_manager.approve_trade(
-            signal,
+    async def execute_signal(
+        self,
+        signal: TradeSignal,
+        override_params: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        Execute a trade signal.
+
+        Args:
+            signal: trade to execute
+            override_params: optional dict overriding execution thresholds
+                             keys: max_deviation_pct, cancel_on_rally_pct,
+                                   market_tolerance_pct
+                             Used by Tier 2 retries to widen tolerance
+                             without touching global config.
+        """
+        override = override_params or {}
+        max_dev = float(
+            override.get("max_deviation_pct", self.max_deviation_pct)
         )
+        cancel_rally = float(
+            override.get("cancel_on_rally_pct", self.cancel_on_rally_pct)
+        )
+        market_tol = float(
+            override.get(
+                "market_tolerance_pct", self.market_tolerance_pct,
+            )
+        )
+
+        approved, size_usd, reason = self.risk_manager.approve_trade(signal)
         if not approved:
             logger.warning(f"Trade rejected by risk manager: {reason}")
             return {"status": "rejected", "reason": reason}
@@ -232,9 +258,6 @@ class TradeExecutor:
 
         existing = self._pending_entries.get(signal.symbol)
         if existing is not None and not existing.done():
-            logger.info(
-                f"{signal.symbol}: pending entry already in progress"
-            )
             return {
                 "status": "pending_limit",
                 "reason": "duplicate_pending",
@@ -242,19 +265,10 @@ class TradeExecutor:
             }
 
         if signal.symbol in self.active_positions:
-            logger.info(
-                f"{signal.symbol}: already have active position"
-            )
-            return {
-                "status": "rejected",
-                "reason": "position_exists",
-            }
+            return {"status": "rejected", "reason": "position_exists"}
 
         current_price = await self._get_current_price(signal.symbol)
         if current_price <= 0:
-            logger.warning(
-                f"{signal.symbol}: no price — defaulting to market"
-            )
             return await self._execute_market_entry(signal, qty)
 
         deviation_pct = (
@@ -268,40 +282,46 @@ class TradeExecutor:
         logger.info(
             f"{signal.symbol}: entry={signal.entry_price:.6f} "
             f"current={current_price:.6f} "
-            f"dev={deviation_pct:.3f}% rally={rally_pct:.3f}%"
+            f"dev={deviation_pct:.3f}% rally={rally_pct:.3f}% "
+            f"[max_dev={max_dev:.2f}% "
+            f"tol={market_tol:.2f}% "
+            f"rally_cancel={cancel_rally:.2f}%]"
         )
 
-        if deviation_pct > self.max_deviation_pct:
+        # Check 1: deviation gate (using override max_dev)
+        if deviation_pct > max_dev:
             logger.info(
                 f"{signal.symbol}: deviation {deviation_pct:.2f}% > "
-                f"max {self.max_deviation_pct}% — skipping stale signal"
+                f"max {max_dev}% — skipping stale signal"
             )
             return {"status": "skipped", "reason": "stale_entry"}
 
         if self.entry_order_type == "market":
             return await self._execute_market_entry(signal, qty)
 
-        if rally_pct > self.cancel_on_rally_pct:
+        # Check 2: rally gate (using override cancel_rally)
+        if rally_pct > cancel_rally:
             logger.info(
-                f"{signal.symbol}: price already rallied "
-                f"{rally_pct:.2f}% > cancel threshold "
-                f"{self.cancel_on_rally_pct}% — skipping"
+                f"{signal.symbol}: rallied {rally_pct:.2f}% > "
+                f"cancel threshold {cancel_rally}% — skipping"
             )
             return {"status": "skipped", "reason": "rally_too_far"}
 
-        if deviation_pct <= self.market_tolerance_pct:
+        # Check 3: market vs limit routing (using override market_tol)
+        if deviation_pct <= market_tol:
             logger.info(
                 f"{signal.symbol}: within tolerance "
-                f"({deviation_pct:.3f}%) — MARKET order"
+                f"({deviation_pct:.3f}% <= {market_tol:.2f}%) — MARKET"
             )
             return await self._execute_market_entry(signal, qty)
 
+        # Otherwise: limit order path (unchanged)
         if self.entry_order_type == "limit_only":
             logger.info(f"{signal.symbol}: limit_only — LIMIT")
         else:
             logger.info(
                 f"{signal.symbol}: dev {deviation_pct:.3f}% > "
-                f"tolerance {self.market_tolerance_pct}% — LIMIT at "
+                f"tolerance {market_tol:.2f}% — LIMIT at "
                 f"{signal.entry_price:.6f}"
             )
         return await self._spawn_limit_entry(signal, qty)

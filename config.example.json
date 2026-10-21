@@ -153,5 +153,22 @@
 
   "agreement": {
     "min_agree": 2
+  },
+  "realtime": {
+    "enabled": true,
+    "max_connections": 2,
+    "selection": "top_by_turnover",
+    "symbols": [],
+    "max_symbols": 20,
+    "analysis_concurrency": 3,
+    "callback_timeout_sec": 180,
+    "gap_fill_recent_minutes": 10,
+
+    "tier2_enabled": true,
+    "tier2_for_invalid": false,
+    "tier2_deviation_multiplier": 1.5,
+    "tier2_market_tolerance_multiplier": 100.0,
+    "suppress_tier2_alerts": true
+
   }
 }
