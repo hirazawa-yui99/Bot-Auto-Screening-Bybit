@@ -153,7 +153,7 @@ python main.py
   "database": {
     "host": "127.0.0.1",
     "database": "bybit_bot_v9",
-    "user": "nazhier",
+    "user": "postgres",
     "password": "no-special-chars",
     "port": "5432"
   },
